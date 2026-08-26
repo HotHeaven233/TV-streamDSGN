@@ -593,6 +593,237 @@ class feature_extraction_neck(nn.Module):
                         nn.ReLU(inplace=True)
                     )
 
+    def forward_stereo_roi(
+        self,
+        feats,
+        base_rect,
+        base_halo=4,
+    ):
+        """
+        ROI forward for the stereo output of the current FPN neck.
+
+        Current supported configuration:
+            start_level == 2
+            with_upconv == True
+            upconv_type == 'fpn'
+            share_upconv == False
+            drop_psv == False
+            cat_img_feature == False
+            with_sem_neck == False
+
+        Coordinate convention
+        ---------------------
+        base_rect is on the common layer2/layer3/layer4 grid.
+
+        Current R18 configuration:
+            layer2/3/4 :  80 x 312
+            layer1     : 160 x 624
+            raw image  : 320 x 1248
+            stereo out : 320 x 1248
+
+        We keep SPP full-context, but only execute:
+            FPN conv / redirect / upsample / lastconv
+        on an expanded local rectangle.
+
+        Returns
+        -------
+        stereo_patch:
+            Current recomputed stereo-feature core patch.
+
+        output_rect:
+            Rectangle of stereo_patch in full 320x1248 stereo coordinates.
+        """
+        if self.start_level != 2:
+            raise RuntimeError(
+                f'ROI neck expects start_level=2, got {self.start_level}'
+            )
+
+        if not self.with_upconv:
+            raise RuntimeError('ROI neck currently requires with_upconv=True')
+
+        if self.upconv_type != 'fpn':
+            raise RuntimeError(
+                f'ROI neck currently supports FPN only, got {self.upconv_type}'
+            )
+
+        if self.share_upconv:
+            raise RuntimeError(
+                'ROI neck currently requires share_upconv=False'
+            )
+
+        if self.drop_psv:
+            raise RuntimeError(
+                'ROI stereo neck is meaningless when drop_psv=True'
+            )
+
+        if self.cat_img_feature or self.with_sem_neck:
+            raise RuntimeError(
+                'Current ROI neck implementation assumes '
+                'cat_img_feature=False and with_sem_neck=False'
+            )
+
+        if len(feats) != len(self.in_dims):
+            raise RuntimeError(
+                f'len(feats)={len(feats)}, '
+                f'len(in_dims)={len(self.in_dims)}'
+            )
+
+        img = feats[0]
+        layer1 = feats[1]
+
+        H, W = feats[self.start_level].shape[-2:]
+
+        for x in feats[self.start_level:]:
+            if tuple(x.shape[-2:]) != (H, W):
+                raise RuntimeError(
+                    'Current ROI neck expects layer2/3/4 to share H/W'
+                )
+
+        if tuple(layer1.shape[-2:]) != (H * 2, W * 2):
+            raise RuntimeError(
+                f'layer1 shape={tuple(layer1.shape[-2:])}, '
+                f'expected={(H*2, W*2)}'
+            )
+
+        if tuple(img.shape[-2:]) != (H * 4, W * 4):
+            raise RuntimeError(
+                f'image shape={tuple(img.shape[-2:])}, '
+                f'expected={(H*4, W*4)}'
+            )
+
+        y0, y1, x0, x1 = [int(v) for v in base_rect]
+
+        if not (
+            0 <= y0 < y1 <= H
+            and
+            0 <= x0 < x1 <= W
+        ):
+            raise RuntimeError(
+                f'Invalid base_rect={base_rect} for {(H, W)}'
+            )
+
+        halo = int(base_halo)
+
+        ey0 = max(0, y0 - halo)
+        ey1 = min(H, y1 + halo)
+        ex0 = max(0, x0 - halo)
+        ex1 = min(W, x1 + halo)
+
+        # ------------------------------------------------------------
+        # Full-context SPP.
+        #
+        # SPP is deliberately kept full because the original module uses
+        # large fixed AvgPool windows. Cropping before SPP changes its
+        # mathematical meaning.
+        # ------------------------------------------------------------
+        feat_shape = (H, W)
+
+        concat_local = [
+            x[..., ey0:ey1, ex0:ex1]
+            for x in feats[self.start_level:]
+        ]
+
+        if self.with_spp:
+            for branch_module in self.spp_branches:
+                spp = branch_module(feats[-1])
+
+                spp = F.interpolate(
+                    spp,
+                    feat_shape,
+                    mode='bilinear',
+                    align_corners=True,
+                )
+
+                concat_local.append(
+                    spp[..., ey0:ey1, ex0:ex1]
+                )
+
+        x = torch.cat(concat_local, dim=1).contiguous()
+
+        # ------------------------------------------------------------
+        # Original FPN upconv, but only on the expanded ROI.
+        # ------------------------------------------------------------
+        up = self.upconv_module
+
+        if len(up.conv) != 2 or len(up.redir) != 2:
+            raise RuntimeError(
+                'Current ROI neck assumes exactly two FPN upconv stages'
+            )
+
+        # Base grid: H x W.
+        x = up.conv[0](x)
+
+        # layer1 redirect on 2x grid.
+        l1_crop = layer1[
+            ...,
+            ey0 * 2:ey1 * 2,
+            ex0 * 2:ex1 * 2
+        ].contiguous()
+
+        redir = up.redir[0](l1_crop)
+
+        x = F.relu(
+            up.up(x) + redir,
+            inplace=False,
+        )
+
+        # 2x grid.
+        x = up.conv[1](x)
+
+        # Raw-image redirect on 4x grid.
+        img_crop = img[
+            ...,
+            ey0 * 4:ey1 * 4,
+            ex0 * 4:ex1 * 4
+        ].contiguous()
+
+        redir = up.redir[1](img_crop)
+
+        x = F.relu(
+            up.up(x) + redir,
+            inplace=False,
+        )
+
+        # ------------------------------------------------------------
+        # Original final stereo conv, locally.
+        # ------------------------------------------------------------
+        x = self.lastconv(x)
+
+        # x corresponds to expanded base rectangle E at 4x resolution.
+        oy0 = (y0 - ey0) * 4
+        oy1 = oy0 + (y1 - y0) * 4
+
+        ox0 = (x0 - ex0) * 4
+        ox1 = ox0 + (x1 - x0) * 4
+
+        stereo_patch = x[
+            ...,
+            oy0:oy1,
+            ox0:ox1
+        ]
+
+        output_rect = (
+            y0 * 4,
+            y1 * 4,
+            x0 * 4,
+            x1 * 4,
+        )
+
+        expected_hw = (
+            (y1 - y0) * 4,
+            (x1 - x0) * 4,
+        )
+
+        if tuple(stereo_patch.shape[-2:]) != expected_hw:
+            raise RuntimeError(
+                f'ROI neck output mismatch: '
+                f'got={tuple(stereo_patch.shape[-2:])}, '
+                f'expected={expected_hw}'
+            )
+
+        return stereo_patch, output_rect
+
+
     def forward(self, feats, right=False):
         feat_shape = tuple(feats[self.start_level].shape[2:])
         assert len(feats) == len(self.in_dims)
