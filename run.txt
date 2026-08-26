@@ -36,3 +36,7 @@ python -u tools/test_realtime_stream.py \
   --latency_scope gpu_pipeline \
   --warmup 50 \
   2>&1 | tee /data/jhb/logs/streamdsgn_realtime_4090.log
+
+python -u tools/test_component_latency.py \
+  --num_frames 100 \
+  --warmup 20
