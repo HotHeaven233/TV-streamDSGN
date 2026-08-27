@@ -412,6 +412,62 @@ class StreamDSGN2Backbone(nn.Module):
         self._adaptive_a_ratio = 1.0
         self._adaptive_a_position_mode = 'center'
 
+
+    # ================================================================
+    # Differentiable adaptive-training surrogate
+    #
+    # This is deliberately separate from the physical ROI inference path.
+    # Training computes the full current stage, then composes current/cache
+    # with a straight-through rectangular mask. This keeps ROI location
+    # differentiable while preserving hard rectangular execution semantics in
+    # the forward pass. Physical ROI kernels are profiled/used after training.
+    # ================================================================
+
+    def set_adaptive_training_state(
+        self,
+        a_mask,
+        b_mask,
+        a_cache_left,
+        a_cache_right,
+        b_cache,
+    ):
+        self._adaptive_training_state = {
+            'a_mask': a_mask,
+            'b_mask': b_mask,
+            'a_cache_left': a_cache_left,
+            'a_cache_right': a_cache_right,
+            'b_cache': b_cache,
+        }
+
+    def clear_adaptive_training_state(self):
+        self._adaptive_training_state = None
+
+    @staticmethod
+    def _adaptive_training_mix_2d(current, cache, mask):
+        if cache is None:
+            return current
+        if tuple(cache.shape) != tuple(current.shape):
+            raise RuntimeError(
+                f'adaptive A cache shape mismatch: cache={tuple(cache.shape)}, '
+                f'current={tuple(current.shape)}'
+            )
+        m = F.interpolate(mask.float(), size=current.shape[-2:], mode='nearest')
+        m = m.to(device=current.device, dtype=current.dtype)
+        return m * current + (1.0 - m) * cache.to(current.dtype)
+
+    @staticmethod
+    def _adaptive_training_mix_3d(current, cache, mask):
+        if cache is None:
+            return current
+        if tuple(cache.shape) != tuple(current.shape):
+            raise RuntimeError(
+                f'adaptive B cache shape mismatch: cache={tuple(cache.shape)}, '
+                f'current={tuple(current.shape)}'
+            )
+        m = F.interpolate(mask.float(), size=current.shape[-2:], mode='nearest')
+        m = m[:, :, None].to(device=current.device, dtype=current.dtype)
+        return m * current + (1.0 - m) * cache.to(current.dtype)
+
     def adaptive_a_is_enabled(self):
         self._ensure_adaptive_a_runtime()
         return bool(self._adaptive_a_enabled)
@@ -1098,7 +1154,40 @@ class StreamDSGN2Backbone(nn.Module):
                 right_shallow = None
                 right_stereo_feat, right_sem_feat = None, None
 
-        # Expose A_s output for the future importance predictor.
+        # ------------------------------------------------------------
+        # Training-time A-stage interface composition.
+        # Q_A lives on the 80x312 A_d native grid; the mask is resized to the
+        # dense stereo-output grid (320x1248 in the current configuration).
+        # ------------------------------------------------------------
+        train_state = getattr(self, '_adaptive_training_state', None)
+        batch_dict['adaptive_stage_a_left_current'] = left_stereo_feat
+        if not self.mono:
+            batch_dict['adaptive_stage_a_right_current'] = right_stereo_feat
+
+        if train_state is not None:
+            if self.cat_img_feature or self.cat_right_img_feature:
+                raise NotImplementedError(
+                    'The current adaptive-training surrogate assumes '
+                    'cat_img_feature=False and cat_right_img_feature=False, '
+                    'which matches the supplied StreamDSGN config.'
+                )
+            left_stereo_feat = self._adaptive_training_mix_2d(
+                left_stereo_feat,
+                train_state['a_cache_left'],
+                train_state['a_mask'],
+            )
+            if not self.mono:
+                right_stereo_feat = self._adaptive_training_mix_2d(
+                    right_stereo_feat,
+                    train_state['a_cache_right'],
+                    train_state['a_mask'],
+                )
+
+        batch_dict['adaptive_stage_a_left'] = left_stereo_feat
+        if not self.mono:
+            batch_dict['adaptive_stage_a_right'] = right_stereo_feat
+
+        # Expose A_s output for the importance predictor.
         batch_dict['left_shallow_feature'] = left_shallow
         if right_shallow is not None:
             batch_dict['right_shallow_feature'] = right_shallow
@@ -1163,6 +1252,22 @@ class StreamDSGN2Backbone(nn.Module):
                 out = upcost_i.unsqueeze(1)
             else:
                 raise ValueError('wrong self.use_stereo_out_type option')
+
+
+            # --------------------------------------------------------
+            # Training-time B-stage interface composition.
+            # B native ROI grid is H=80,W=312 in the current configuration.
+            # The mask is broadcast over disparity/depth D.
+            # --------------------------------------------------------
+            batch_dict['adaptive_stage_b_current'] = out
+            train_state = getattr(self, '_adaptive_training_state', None)
+            if train_state is not None:
+                out = self._adaptive_training_mix_3d(
+                    out,
+                    train_state['b_cache'],
+                    train_state['b_mask'],
+                )
+            batch_dict['adaptive_stage_b'] = out
 
         # torch.cuda.synchronize()
         # t2 = time.time()
