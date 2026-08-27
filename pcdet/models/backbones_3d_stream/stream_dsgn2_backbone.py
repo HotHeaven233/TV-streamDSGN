@@ -6,8 +6,6 @@ import torch.utils.data
 import torch.nn.functional as F
 import numpy as np
 
-# STREAMDSGN_LATENCY_OPT_V1
-
 from mmdet.models.builder import build_backbone, build_neck
 from . import submodule
 from .submodule import convbn_3d, convbn, feature_extraction_neck
@@ -69,24 +67,6 @@ class StreamDSGN2Backbone(nn.Module):
             self.feature_backbone.init_weights(pretrained=feature_backbone_pretrained)
 
         self.feature_neck = feature_extraction_neck(model_cfg.feature_neck)
-        # STREAMDSGN_LATENCY_OPT_V1: side-specific low-res SPP caches.
-        self._adaptive_spp_capture_side = None
-        self._adaptive_spp_cache = {'left': None, 'right': None}
-        self._adaptive_spp_hook_handles = []
-        if getattr(self.feature_neck, 'with_spp', False):
-            num_spp = len(self.feature_neck.spp_branches)
-            self._adaptive_spp_cache = {
-                'left': [None] * num_spp,
-                'right': [None] * num_spp,
-            }
-            for _spp_idx, _spp_branch in enumerate(self.feature_neck.spp_branches):
-                def _capture_spp(module, inputs, output, idx=_spp_idx):
-                    side = self._adaptive_spp_capture_side
-                    if side in ('left', 'right'):
-                        self._adaptive_spp_cache[side][idx] = output.detach()
-                self._adaptive_spp_hook_handles.append(
-                    _spp_branch.register_forward_hook(_capture_spp)
-                )
         if getattr(model_cfg, 'sem_neck', None):
             self.sem_neck = build_neck(model_cfg.sem_neck)
         else:
@@ -160,18 +140,38 @@ class StreamDSGN2Backbone(nn.Module):
         self.voxel_size, self.grid_size = voxel_size, grid_size
         self.prepare_depth(self.point_cloud_range, in_camera_view=False)
         self.prepare_coordinates_3d(self.point_cloud_range, voxel_size, grid_size)
-        # STREAMDSGN_LATENCY_OPT_V1: resident static tensors.
+
+        # Runtime-only optimization:
+        # these tensors are static model constants. Register them as
+        # non-persistent buffers so model.cuda() moves them once instead of
+        # performing CPU->GPU copies in every inference frame.
         for _name in (
-            'downsampled_depth', 'downsampledx2_depth', 'depth', 'coordinates_3d'
+            'downsampled_depth',
+            'downsampledx2_depth',
+            'depth',
+            'coordinates_3d',
         ):
             _tensor = getattr(self, _name)
             delattr(self, _name)
-            self.register_buffer(_name, _tensor.contiguous(), persistent=False)
             self.register_buffer(
-                f'_adaptive_{_name}_half',
-                _tensor.half().contiguous(),
+                _name,
+                _tensor.contiguous(),
                 persistent=False,
             )
+
+        # AMP inference uses resident FP16 copies for the two tensors that are
+        # consumed directly in the hot full-forward path.
+        self.register_buffer(
+            '_downsampled_depth_fp16',
+            self.downsampled_depth.half().contiguous(),
+            persistent=False,
+        )
+        self.register_buffer(
+            '_coordinates_3d_fp16',
+            self.coordinates_3d.half().contiguous(),
+            persistent=False,
+        )
+
         self.max_crop_shape = kwargs.get('max_crop_shape', (320, 1248))
         if self.front_surface_depth:
             crop_x1, crop_x2, crop_y1, crop_y2 = 0, self.max_crop_shape[1], 0, self.max_crop_shape[0]
@@ -333,728 +333,6 @@ class StreamDSGN2Backbone(nn.Module):
         features = [img] + list(features)
         return self.feature_neck(features)
 
-
-    # ================================================================
-    # Adaptive stage-A support
-    #
-    # A_s = stem + layer1, always full.
-    # A_d = layer2 + layer3 + layer4, optionally selective.
-    #
-    # IMPORTANT:
-    #   feature_neck is intentionally kept FULL in this first version.
-    #   We first profile whether localizing layer2--4 is physically useful
-    #   before making the SPP/FPN neck selective.
-    # ================================================================
-
-    def _ensure_adaptive_a_runtime(self):
-        if hasattr(self, '_adaptive_a_enabled'):
-            return
-
-        self._adaptive_a_enabled = False
-        self._adaptive_a_ratio = 1.0
-        self._adaptive_a_position_mode = 'center'
-
-        # Cache layer2/layer3/layer4 output for left/right independently.
-        self._adaptive_a_cache = {
-            'left': [None, None, None],
-            'right': [None, None, None],
-        }
-
-        # Final dense stereo-feature cache seen by stage B.
-        #
-        # Current shape:
-        #     [N, 96, 320, 1248]
-        #
-        # layer2/3/4 caches above are internal A_d execution caches.
-        # This stereo cache is the actual A-stage interface cache.
-        self._adaptive_a_stereo_cache = {
-            'left': None,
-            'right': None,
-        }
-
-        # Halo on the layer2/3/4 common 80x312 grid used by
-        # local FPN/upconv/lastconv execution.
-        self._adaptive_a_neck_halo = 2
-
-        # ROI is defined on layer2/3/4 common H/W grid.
-        # For current R18 config:
-        # layer1: 160x624
-        # layer2:  80x312
-        # layer3:  80x312
-        # layer4:  80x312
-        #
-        # Halo is measured on the corresponding output grid.
-        # These are deliberately conservative starting values.
-        self._adaptive_a_halos = {1: 2, 2: 2, 3: 2}
-
-        self._adaptive_a_last_roi = None
-        self._adaptive_a_last_output_roi = None
-
-    def reset_adaptive_a_cache(self):
-        self._ensure_adaptive_a_runtime()
-
-        self._adaptive_a_cache = {
-            'left': [None, None, None],
-            'right': [None, None, None],
-        }
-
-        self._adaptive_a_stereo_cache = {
-            'left': None,
-            'right': None,
-        }
-
-        self._adaptive_a_last_roi = None
-        self._adaptive_a_last_output_roi = None
-
-    def set_adaptive_a_profile(self, ratio, position_mode='center'):
-        """
-        Offline profiling override.
-
-        ratio:
-            0.0 -> no layer2--4 refresh; use stage cache
-            1.0 -> full layer2--4 refresh
-            (0,1) -> one rectangular ROI
-
-        position_mode:
-            center / boundary / random
-
-        This function is for profiling/debugging. The final learned scheduler
-        will provide its own ROI metadata on GPU.
-        """
-        self._ensure_adaptive_a_runtime()
-
-        ratio = float(ratio)
-        if ratio < 0.0 or ratio > 1.0:
-            raise ValueError(f'ratio must be in [0,1], got {ratio}')
-
-        if position_mode not in ('center', 'boundary', 'random'):
-            raise ValueError(position_mode)
-
-        self._adaptive_a_enabled = True
-        self._adaptive_a_ratio = ratio
-        self._adaptive_a_position_mode = position_mode
-
-    def clear_adaptive_a_profile(self):
-        self._ensure_adaptive_a_runtime()
-        self._adaptive_a_enabled = False
-        self._adaptive_a_ratio = 1.0
-        self._adaptive_a_position_mode = 'center'
-
-
-    # ================================================================
-    # Differentiable adaptive-training surrogate
-    #
-    # This is deliberately separate from the physical ROI inference path.
-    # Training computes the full current stage, then composes current/cache
-    # with a straight-through rectangular mask. This keeps ROI location
-    # differentiable while preserving hard rectangular execution semantics in
-    # the forward pass. Physical ROI kernels are profiled/used after training.
-    # ================================================================
-
-    def set_adaptive_training_state(
-        self,
-        a_mask,
-        b_mask,
-        a_cache_left,
-        a_cache_right,
-        b_cache,
-    ):
-        self._adaptive_training_state = {
-            'a_mask': a_mask,
-            'b_mask': b_mask,
-            'a_cache_left': a_cache_left,
-            'a_cache_right': a_cache_right,
-            'b_cache': b_cache,
-        }
-
-    def clear_adaptive_training_state(self):
-        self._adaptive_training_state = None
-
-    @staticmethod
-    def _adaptive_training_mix_2d(current, cache, mask):
-        if cache is None:
-            return current
-        if tuple(cache.shape) != tuple(current.shape):
-            raise RuntimeError(
-                f'adaptive A cache shape mismatch: cache={tuple(cache.shape)}, '
-                f'current={tuple(current.shape)}'
-            )
-        m = F.interpolate(mask.float(), size=current.shape[-2:], mode='nearest')
-        m = m.to(device=current.device, dtype=current.dtype)
-        return m * current + (1.0 - m) * cache.to(current.dtype)
-
-    @staticmethod
-    def _adaptive_training_mix_3d(current, cache, mask):
-        if cache is None:
-            return current
-        if tuple(cache.shape) != tuple(current.shape):
-            raise RuntimeError(
-                f'adaptive B cache shape mismatch: cache={tuple(cache.shape)}, '
-                f'current={tuple(current.shape)}'
-            )
-        m = F.interpolate(mask.float(), size=current.shape[-2:], mode='nearest')
-        m = m[:, :, None].to(device=current.device, dtype=current.dtype)
-        return m * current + (1.0 - m) * cache.to(current.dtype)
-
-    def adaptive_a_is_enabled(self):
-        self._ensure_adaptive_a_runtime()
-        return bool(self._adaptive_a_enabled)
-
-    def _capture_adaptive_a_full_cache(self, side, backbone_outputs):
-        """
-        backbone_outputs:
-            layer1, layer2, layer3, layer4
-
-        Only layer2--4 are cached because layer1 belongs to A_s and is
-        recomputed fully every frame.
-        """
-        self._ensure_adaptive_a_runtime()
-
-        if self.training:
-            return
-
-        assert side in ('left', 'right')
-        assert len(backbone_outputs) == 4
-
-        # detach() does not copy GPU data; it only keeps a persistent reference.
-        self._adaptive_a_cache[side] = [
-            backbone_outputs[1].detach(),
-            backbone_outputs[2].detach(),
-            backbone_outputs[3].detach(),
-        ]
-
-    def _capture_adaptive_a_stereo_cache(
-        self,
-        side,
-        stereo_feature,
-    ):
-        """
-        Capture complete stage-A output after a Full A execution.
-
-        detach() keeps the tensor on GPU and does not perform a CPU copy.
-        """
-        self._ensure_adaptive_a_runtime()
-
-        if self.training:
-            return
-
-        if side not in ('left', 'right'):
-            raise ValueError(side)
-
-        self._adaptive_a_stereo_cache[side] = \
-            stereo_feature.detach()
-
-        self._adaptive_a_last_output_roi = (
-            0,
-            stereo_feature.shape[-2],
-            0,
-            stereo_feature.shape[-1],
-        )
-
-    @staticmethod
-    def _adaptive_a_update_dense_cache(
-        cache,
-        patch,
-        rect,
-    ):
-        """
-        Update only the recomputed current-frame patch in a dense cache.
-        """
-        y0, y1, x0, x1 = [int(v) for v in rect]
-
-        expected_hw = (
-            y1 - y0,
-            x1 - x0,
-        )
-
-        if tuple(patch.shape[-2:]) != expected_hw:
-            raise RuntimeError(
-                'A stereo cache patch mismatch: '
-                f'patch={tuple(patch.shape[-2:])}, '
-                f'expected={expected_hw}, '
-                f'rect={rect}'
-            )
-
-        cache[
-            ...,
-            y0:y1,
-            x0:x1
-        ].copy_(patch)
-
-    def forward_2d_shallow(self, img):
-        """
-        Exact ResNet stem + layer1 forward.
-
-        Current configuration:
-            deep_stem=False
-            with_max_pool=False
-
-        The code still handles with_max_pool=True.
-        """
-        bb = self.feature_backbone
-
-        if getattr(bb, 'deep_stem', False):
-            x = bb.stem(img)
-        else:
-            x = bb.conv1(img)
-            x = bb.norm1(x)
-            x = bb.relu(x)
-
-        if getattr(bb, 'with_max_pool', False):
-            x = bb.maxpool(x)
-
-        if not hasattr(bb, 'res_layers') or len(bb.res_layers) != 4:
-            raise RuntimeError(
-                'Adaptive A currently expects a 4-stage MMDetection ResNet'
-            )
-
-        layer1 = getattr(bb, bb.res_layers[0])
-        x = layer1(x)
-
-        return x
-
-    def forward_2d_deep_full_from_shallow(
-        self,
-        img,
-        shallow,
-        return_stage_features=False,
-        side=None,
-    ):
-        """
-        Run layer2--4 + the original feature_neck from a full layer1 tensor.
-
-        Numerically this should match:
-            feature_backbone(img) -> feature_neck(...)
-        """
-        bb = self.feature_backbone
-
-        out_indices = tuple(getattr(bb, 'out_indices', (0, 1, 2, 3)))
-        if out_indices != (0, 1, 2, 3):
-            raise RuntimeError(
-                f'Adaptive A expects out_indices=(0,1,2,3), got {out_indices}'
-            )
-
-        feats = [shallow]
-        x = shallow
-
-        for layer_name in bb.res_layers[1:]:
-            x = getattr(bb, layer_name)(x)
-            feats.append(x)
-
-        old_side = self._adaptive_spp_capture_side
-        self._adaptive_spp_capture_side = side
-        try:
-            stereo_feature, sem_feature = self.feature_neck([img] + feats)
-        finally:
-            self._adaptive_spp_capture_side = old_side
-
-        if return_stage_features:
-            return stereo_feature, sem_feature, feats
-
-        return stereo_feature, sem_feature
-
-    @staticmethod
-    def _adaptive_a_expand_rect(rect, H, W, halo):
-        y0, y1, x0, x1 = rect
-
-        return (
-            max(0, y0 - halo),
-            min(H, y1 + halo),
-            max(0, x0 - halo),
-            min(W, x1 + halo),
-        )
-
-    @staticmethod
-    def _adaptive_a_rect_from_ratio(
-        H,
-        W,
-        ratio,
-        position_mode='center',
-        align=4,
-    ):
-        """
-        Convert an area ratio into one rectangular ROI.
-
-        The rectangle approximately preserves the full feature-map aspect ratio:
-            roi_h/H ~= roi_w/W ~= sqrt(ratio)
-        """
-        if ratio <= 0:
-            return None
-
-        if ratio >= 1:
-            return (0, H, 0, W)
-
-        scale = ratio ** 0.5
-
-        rh = int(round(H * scale / align)) * align
-        rw = int(round(W * scale / align)) * align
-
-        rh = min(H, max(align, rh))
-        rw = min(W, max(align, rw))
-
-        if position_mode == 'center':
-            y0 = (H - rh) // 2
-            x0 = (W - rw) // 2
-
-        elif position_mode == 'boundary':
-            # bottom-right legal boundary
-            y0 = H - rh
-            x0 = W - rw
-
-        elif position_mode == 'random':
-            # deterministic pseudo-random location.
-            # Offline profiling only; no GPU->CPU synchronization.
-            sy = H - rh
-            sx = W - rw
-
-            y0 = 0 if sy == 0 else ((37 * sy + 11 * sx + 17) % (sy + 1))
-            x0 = 0 if sx == 0 else ((53 * sx + 7 * sy + 29) % (sx + 1))
-
-        else:
-            raise ValueError(position_mode)
-
-        return (
-            int(y0),
-            int(y0 + rh),
-            int(x0),
-            int(x0 + rw),
-        )
-
-    def _adaptive_a_run_layer2_roi(self, shallow, rect, halo):
-        """
-        Run ResNet layer2 on a cropped layer1 feature.
-
-        rect is defined on layer2 output coordinates.
-
-        Current config has:
-            layer1 -> layer2 spatial stride = 2
-        """
-        bb = self.feature_backbone
-        layer2 = getattr(bb, bb.res_layers[1])
-
-        H1, W1 = shallow.shape[-2:]
-
-        # Expected full layer2 shape for stride=2.
-        H2 = (H1 + 1) // 2
-        W2 = (W1 + 1) // 2
-
-        y0, y1, x0, x1 = rect
-
-        ey0, ey1, ex0, ex1 = self._adaptive_a_expand_rect(
-            rect, H2, W2, halo
-        )
-
-        # Preserve global stride phase.
-        iy0 = ey0 * 2
-        iy1 = min(H1, ey1 * 2)
-        ix0 = ex0 * 2
-        ix1 = min(W1, ex1 * 2)
-
-        x = shallow[..., iy0:iy1, ix0:ix1].contiguous()
-        y = layer2(x)
-
-        expected_hw = (ey1 - ey0, ex1 - ex0)
-        if tuple(y.shape[-2:]) != expected_hw:
-            raise RuntimeError(
-                'layer2 local shape mismatch: '
-                f'got={tuple(y.shape[-2:])}, expected={expected_hw}'
-            )
-
-        cy0 = y0 - ey0
-        cy1 = cy0 + (y1 - y0)
-        cx0 = x0 - ex0
-        cx1 = cx0 + (x1 - x0)
-
-        return y[..., cy0:cy1, cx0:cx1]
-
-    def _adaptive_a_run_stride1_roi(
-        self,
-        layer,
-        dense_input,
-        rect,
-        halo,
-    ):
-        """
-        Local execution for layer3/layer4.
-
-        Current config uses stride=1 for both, so input/output H/W are equal.
-        """
-        H, W = dense_input.shape[-2:]
-
-        y0, y1, x0, x1 = rect
-
-        ey0, ey1, ex0, ex1 = self._adaptive_a_expand_rect(
-            rect, H, W, halo
-        )
-
-        x = dense_input[..., ey0:ey1, ex0:ex1].contiguous()
-        y = layer(x)
-
-        expected_hw = (ey1 - ey0, ex1 - ex0)
-        if tuple(y.shape[-2:]) != expected_hw:
-            raise RuntimeError(
-                'stride-1 local shape mismatch: '
-                f'got={tuple(y.shape[-2:])}, expected={expected_hw}'
-            )
-
-        cy0 = y0 - ey0
-        cy1 = cy0 + (y1 - y0)
-        cx0 = x0 - ex0
-        cx1 = cx0 + (x1 - x0)
-
-        return y[..., cy0:cy1, cx0:cx1]
-
-    @staticmethod
-    def _adaptive_a_update_cache(cache, patch, rect):
-        """
-        Patch-update without cloning the full tensor.
-        """
-        y0, y1, x0, x1 = rect
-
-        if tuple(patch.shape[-2:]) != (y1 - y0, x1 - x0):
-            raise RuntimeError(
-                f'patch={tuple(patch.shape[-2:])}, '
-                f'roi={(y1-y0, x1-x0)}'
-            )
-
-        cache[..., y0:y1, x0:x1].copy_(patch)
-
-    def forward_2d_adaptive(self, img, side):
-        """
-        A_s:
-            full stem + layer1
-
-        A_d:
-            selective layer2/3/4 with persistent dense cache
-
-        feature_neck:
-            full in this first implementation.
-
-        This path is inference-only.
-        """
-        self._ensure_adaptive_a_runtime()
-
-        if self.training:
-            raise RuntimeError(
-                'forward_2d_adaptive is currently inference/profiling only'
-            )
-
-        if side not in ('left', 'right'):
-            raise ValueError(side)
-
-        shallow = self.forward_2d_shallow(img)
-
-        ratio = float(self._adaptive_a_ratio)
-        position_mode = self._adaptive_a_position_mode
-        cache = self._adaptive_a_cache[side]
-
-        # Cache not initialized yet:
-        # perform one full layer2--4 pass and initialize it.
-        if any(x is None for x in cache):
-            stereo_feature, sem_feature, feats = \
-                self.forward_2d_deep_full_from_shallow(
-                    img,
-                    shallow,
-                    return_stage_features=True,
-                    side=side,
-                )
-
-            self._adaptive_a_cache[side] = [
-                feats[1].detach(),
-                feats[2].detach(),
-                feats[3].detach(),
-            ]
-
-            self._capture_adaptive_a_stereo_cache(
-                side,
-                stereo_feature,
-            )
-
-            self._adaptive_a_last_roi = (
-                0,
-                feats[1].shape[-2],
-                0,
-                feats[1].shape[-1],
-            )
-
-            return shallow, stereo_feature, sem_feature
-
-        # Stage-Full A_d.
-        if ratio >= 1.0 - 1e-8:
-            stereo_feature, sem_feature, feats = \
-                self.forward_2d_deep_full_from_shallow(
-                    img,
-                    shallow,
-                    return_stage_features=True,
-                    side=side,
-                )
-
-            self._adaptive_a_cache[side] = [
-                feats[1].detach(),
-                feats[2].detach(),
-                feats[3].detach(),
-            ]
-
-            self._capture_adaptive_a_stereo_cache(
-                side,
-                stereo_feature,
-            )
-
-            self._adaptive_a_last_roi = (
-                0,
-                feats[1].shape[-2],
-                0,
-                feats[1].shape[-1],
-            )
-
-            return shallow, stereo_feature, sem_feature
-
-        # All layer2--4 caches share the same H/W in the current R18 config.
-        H2, W2 = cache[0].shape[-2:]
-
-        for c in cache[1:]:
-            if tuple(c.shape[-2:]) != (H2, W2):
-                raise RuntimeError(
-                    'Current adaptive A implementation expects '
-                    'layer2/layer3/layer4 to share H/W'
-                )
-
-        rect = self._adaptive_a_rect_from_ratio(
-            H2,
-            W2,
-            ratio,
-            position_mode=position_mode,
-            align=4,
-        )
-
-        # ratio == 0:
-        # skip all layer2--4 recomputation and directly use the stage caches.
-        if rect is not None:
-            bb = self.feature_backbone
-
-            # --------------------------------------------------------
-            # layer2
-            # --------------------------------------------------------
-            patch2 = self._adaptive_a_run_layer2_roi(
-                shallow,
-                rect,
-                self._adaptive_a_halos[1],
-            )
-
-            self._adaptive_a_update_cache(
-                cache[0],
-                patch2,
-                rect,
-            )
-
-            # --------------------------------------------------------
-            # layer3
-            # Input is the CURRENT/CACHED dense layer2 map.
-            # --------------------------------------------------------
-            layer3 = getattr(bb, bb.res_layers[2])
-
-            patch3 = self._adaptive_a_run_stride1_roi(
-                layer3,
-                cache[0],
-                rect,
-                self._adaptive_a_halos[2],
-            )
-
-            self._adaptive_a_update_cache(
-                cache[1],
-                patch3,
-                rect,
-            )
-
-            # --------------------------------------------------------
-            # layer4
-            # Input is the CURRENT/CACHED dense layer3 map.
-            # --------------------------------------------------------
-            layer4 = getattr(bb, bb.res_layers[3])
-
-            patch4 = self._adaptive_a_run_stride1_roi(
-                layer4,
-                cache[1],
-                rect,
-                self._adaptive_a_halos[3],
-            )
-
-            self._adaptive_a_update_cache(
-                cache[2],
-                patch4,
-                rect,
-            )
-
-        # Current full shallow layer1 + dense current/cache layer2--4.
-        feats = [
-            img,
-            shallow,
-            cache[0],
-            cache[1],
-            cache[2],
-        ]
-
-        stereo_cache = self._adaptive_a_stereo_cache[side]
-
-        if stereo_cache is None:
-            raise RuntimeError(
-                'Adaptive A stereo cache is not initialized. '
-                'Each scene must start from a Full frame.'
-            )
-
-        # ------------------------------------------------------------
-        # Reuse-only A_d:
-        #
-        # A_s still runs fully, but layer2--4 and feature_neck are
-        # completely skipped.
-        # ------------------------------------------------------------
-        if rect is None:
-            self._adaptive_a_last_roi = None
-            self._adaptive_a_last_output_roi = None
-
-            stereo_feature = stereo_cache
-
-            # Current config:
-            #   cat_img_feature=False
-            #   with_sem_neck=False
-            sem_feature = None
-
-            return shallow, stereo_feature, sem_feature
-
-        # ------------------------------------------------------------
-        # Local neck execution.
-        #
-        # SPP keeps global context, while FPN/upconv/lastconv execute
-        # only around the selected image-space ROI.
-        # ------------------------------------------------------------
-        stereo_patch, output_rect = \
-            self.feature_neck.forward_stereo_roi(
-                feats,
-                base_rect=rect,
-                base_halo=self._adaptive_a_neck_halo,
-                spp_cache=self._adaptive_spp_cache[side],
-            )
-
-        # Current ROI overwrites the corresponding part of the
-        # persistent dense A-stage output cache.
-        self._adaptive_a_update_dense_cache(
-            stereo_cache,
-            stereo_patch,
-            output_rect,
-        )
-
-        self._adaptive_a_last_roi = rect
-        self._adaptive_a_last_output_roi = output_rect
-
-        # Dense stage-A output consumed by B:
-        #
-        #   current ROI + historical A cache outside.
-        stereo_feature = stereo_cache
-
-        sem_feature = None
-
-        return shallow, stereo_feature, sem_feature
-
     @staticmethod
     def compute_mapping(c3d, image_shape, calib_proj, depth_range, pose_transform=None, use_amp=False):
         coord_img = project_rect_to_image(
@@ -1129,112 +407,37 @@ class StreamDSGN2Backbone(nn.Module):
         N = batch_dict['batch_size']
 
         # feature extraction
-        #
-        # Normal / Global-Full path remains the original backbone+neck path.
-        # Adaptive A path uses:
-        #     full stem+layer1
-        #     selective layer2--4 + cache
-        #     full feature_neck
-        #
-        if self.adaptive_a_is_enabled():
-            left_shallow, left_stereo_feat, left_sem_feat = \
-                self.forward_2d_adaptive(left, side='left')
+        # import time
+        # torch.cuda.synchronize()
+        # t1 = time.time()
+        left_features = self.feature_backbone(left)
+        # torch.cuda.synchronize()
+        # t2 = time.time()
+        # print('left extraction: ', t2-t1)
 
-            if not self.mono:
-                right = batch_dict['right_img']
-                right_shallow, right_stereo_feat, right_sem_feat = \
-                    self.forward_2d_adaptive(right, side='right')
-            else:
-                right_shallow = None
-                right_stereo_feat, right_sem_feat = None, None
-
+        # list: (3, 320, 1248); (64, 160, 624); (128, 80, 312); (128, 80, 312); (128, 80, 312)
+        left_features = [left] + list(left_features)
+        # for x in left_features:
+        #     print(x.dtype)
+        # (512, 80, 312); (96, 320, 1248)
+        # torch.cuda.synchronize()
+        # t1 = time.time()
+        left_stereo_feat, left_sem_feat = self.feature_neck(left_features)
+        # torch.cuda.synchronize()
+        # t2 = time.time()
+        # print('left neck: ', t2-t1)
+        # torch.cuda.synchronize()
+        # t1 = time.time()
+        if not self.mono:
+            right = batch_dict['right_img']
+            right_features = self.feature_backbone(right)
+            right_features = [right] + list(right_features)
+            right_stereo_feat, right_sem_feat = self.feature_neck(right_features)
         else:
-            # Exact original full path.
-            left_backbone_features = self.feature_backbone(left)
-            left_shallow = left_backbone_features[0]
-
-            # Keep references to layer2--4 so the next adaptive frame can
-            # immediately use them as a valid cache. No GPU copy is performed.
-            self._capture_adaptive_a_full_cache(
-                'left',
-                left_backbone_features,
-            )
-
-            left_features = [left] + list(left_backbone_features)
-            self._adaptive_spp_capture_side = 'left'
-            try:
-                left_stereo_feat, left_sem_feat = self.feature_neck(left_features)
-            finally:
-                self._adaptive_spp_capture_side = None
-
-            # Full frame initializes / refreshes the complete A-stage cache.
-            self._capture_adaptive_a_stereo_cache(
-                'left',
-                left_stereo_feat,
-            )
-
-            if not self.mono:
-                right = batch_dict['right_img']
-                right_backbone_features = self.feature_backbone(right)
-                right_shallow = right_backbone_features[0]
-
-                self._capture_adaptive_a_full_cache(
-                    'right',
-                    right_backbone_features,
-                )
-
-                right_features = [right] + list(right_backbone_features)
-                self._adaptive_spp_capture_side = 'right'
-                try:
-                    right_stereo_feat, right_sem_feat = self.feature_neck(right_features)
-                finally:
-                    self._adaptive_spp_capture_side = None
-
-                self._capture_adaptive_a_stereo_cache(
-                    'right',
-                    right_stereo_feat,
-                )
-            else:
-                right_shallow = None
-                right_stereo_feat, right_sem_feat = None, None
-
-        # ------------------------------------------------------------
-        # Training-time A-stage interface composition.
-        # Q_A lives on the 80x312 A_d native grid; the mask is resized to the
-        # dense stereo-output grid (320x1248 in the current configuration).
-        # ------------------------------------------------------------
-        train_state = getattr(self, '_adaptive_training_state', None)
-        batch_dict['adaptive_stage_a_left_current'] = left_stereo_feat
-        if not self.mono:
-            batch_dict['adaptive_stage_a_right_current'] = right_stereo_feat
-
-        if train_state is not None:
-            if self.cat_img_feature or self.cat_right_img_feature:
-                raise NotImplementedError(
-                    'The current adaptive-training surrogate assumes '
-                    'cat_img_feature=False and cat_right_img_feature=False, '
-                    'which matches the supplied StreamDSGN config.'
-                )
-            left_stereo_feat = self._adaptive_training_mix_2d(
-                left_stereo_feat,
-                train_state['a_cache_left'],
-                train_state['a_mask'],
-            )
-            if not self.mono:
-                right_stereo_feat = self._adaptive_training_mix_2d(
-                    right_stereo_feat,
-                    train_state['a_cache_right'],
-                    train_state['a_mask'],
-                )
-
-        batch_dict['adaptive_stage_a_left'] = left_stereo_feat
-        if not self.mono:
-            batch_dict['adaptive_stage_a_right'] = right_stereo_feat
-
-        # Expose A_s output for the importance predictor.
-        batch_dict['left_shallow_feature'] = left_shallow
-        if right_shallow is not None:
-            batch_dict['right_shallow_feature'] = right_shallow
+            right_stereo_feat, right_sem_feat = None, None
+        # torch.cuda.synchronize()
+        # t2 = time.time()
+        # print('right extract and neck: ', t2-t1)
 
         if self.sem_neck is not None:
             batch_dict['sem_features'] = self.sem_neck([left_sem_feat])
@@ -1249,8 +452,9 @@ class StreamDSGN2Backbone(nn.Module):
         if not self.drop_psv:
             # stereo matching: build stereo volume
             downsampled_depth = (
-                self._adaptive_downsampled_depth_half
-                if self.use_amp else self.downsampled_depth
+                self._downsampled_depth_fp16
+                if self.use_amp
+                else self.downsampled_depth
             )
             downsampled_disp = fu_mul_baseline[:, None] / \
                 downsampled_depth[None, :] / (self.downsample_disp if not self.fullres_stereo_feature else 1)
@@ -1300,22 +504,6 @@ class StreamDSGN2Backbone(nn.Module):
             else:
                 raise ValueError('wrong self.use_stereo_out_type option')
 
-
-            # --------------------------------------------------------
-            # Training-time B-stage interface composition.
-            # B native ROI grid is H=80,W=312 in the current configuration.
-            # The mask is broadcast over disparity/depth D.
-            # --------------------------------------------------------
-            batch_dict['adaptive_stage_b_current'] = out
-            train_state = getattr(self, '_adaptive_training_state', None)
-            if train_state is not None:
-                out = self._adaptive_training_mix_3d(
-                    out,
-                    train_state['b_cache'],
-                    train_state['b_mask'],
-                )
-            batch_dict['adaptive_stage_b'] = out
-
         # torch.cuda.synchronize()
         # t2 = time.time()
         # print('PSV:', t2-t1)
@@ -1324,8 +512,9 @@ class StreamDSGN2Backbone(nn.Module):
         # torch.cuda.synchronize()
         # t1 = time.time()
         coordinates_3d = (
-            self._adaptive_coordinates_3d_half
-            if self.use_amp else self.coordinates_3d
+            self._coordinates_3d_fp16
+            if self.use_amp
+            else self.coordinates_3d
         )
         batch_dict['coord'] = coordinates_3d
         norm_coord_imgs = []

@@ -8,20 +8,6 @@ at::Tensor BuildDpsCostVolume_forward_cuda(const at::Tensor &left,
                                         const int sep,
                                         const int interval);
 
-
-at::Tensor BuildDpsCostVolume_forward_roi_cuda(
-    const at::Tensor &left,
-    const at::Tensor &right,
-    const at::Tensor &shift,
-    const at::Tensor &psv_channels,
-    const int downsample,
-    const int sep,
-    const int interval,
-    const int ph0,
-    const int ph1,
-    const int pw0,
-    const int pw1);
-
 std::tuple<at::Tensor, at::Tensor> BuildDpsCostVolume_backward_cuda(const at::Tensor &grad,
                                                                  const at::Tensor &shift,
                                                                  const at::Tensor &psv_channels,
@@ -50,44 +36,6 @@ at::Tensor BuildDpsCostVolume_forward(const at::Tensor &left,
   AT_ERROR("Not implemented on the CPU");
 }
 
-
-at::Tensor BuildDpsCostVolume_forward_roi(
-    const at::Tensor &left,
-    const at::Tensor &right,
-    const at::Tensor &shift,
-    const at::Tensor &psv_channels,
-    const int downsample,
-    const int sep,
-    const int interval,
-    const int ph0,
-    const int ph1,
-    const int pw0,
-    const int pw1)
-{
-  if (left.is_cuda())
-  {
-#ifdef WITH_CUDA
-    return BuildDpsCostVolume_forward_roi_cuda(
-        left,
-        right,
-        shift,
-        psv_channels,
-        downsample,
-        sep,
-        interval,
-        ph0,
-        ph1,
-        pw0,
-        pw1);
-#else
-    AT_ERROR("Not compiled with GPU support");
-#endif
-  }
-
-  AT_ERROR("Not implemented on the CPU");
-}
-
-
 std::tuple<at::Tensor, at::Tensor> BuildDpsCostVolume_backward(const at::Tensor &grad,
                                                             const at::Tensor &shift,
                                                             const at::Tensor &psv_channels,
@@ -110,6 +58,5 @@ std::tuple<at::Tensor, at::Tensor> BuildDpsCostVolume_backward(const at::Tensor 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
   m.def("build_dps_cost_volume_forward", &BuildDpsCostVolume_forward, "BuildDpsCostVolume_forward");
-  m.def("build_dps_cost_volume_forward_roi", &BuildDpsCostVolume_forward_roi, "BuildDpsCostVolume_forward_roi");
   m.def("build_dps_cost_volume_backward", &BuildDpsCostVolume_backward, "BuildDpsCostVolume_backward");
 }

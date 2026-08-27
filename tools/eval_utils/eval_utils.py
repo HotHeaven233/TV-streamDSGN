@@ -146,10 +146,10 @@ def format_paper_metrics(result_text):
             output.append('  IoU={}'.format(iou))
 
             if bev is not None:
-                output.append('    AP_R40 BEV: {}'.format(bev))
+                output.append('    sAPBEV: {}'.format(bev))
 
             if d3 is not None:
-                output.append('    AP_R40 3D : {}'.format(d3))
+                output.append('    sAP3D : {}'.format(d3))
 
     if not found:
         return result_text
