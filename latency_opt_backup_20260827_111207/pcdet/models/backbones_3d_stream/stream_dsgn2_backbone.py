@@ -6,8 +6,6 @@ import torch.utils.data
 import torch.nn.functional as F
 import numpy as np
 
-# STREAMDSGN_LATENCY_OPT_V1
-
 from mmdet.models.builder import build_backbone, build_neck
 from . import submodule
 from .submodule import convbn_3d, convbn, feature_extraction_neck
@@ -69,24 +67,6 @@ class StreamDSGN2Backbone(nn.Module):
             self.feature_backbone.init_weights(pretrained=feature_backbone_pretrained)
 
         self.feature_neck = feature_extraction_neck(model_cfg.feature_neck)
-        # STREAMDSGN_LATENCY_OPT_V1: side-specific low-res SPP caches.
-        self._adaptive_spp_capture_side = None
-        self._adaptive_spp_cache = {'left': None, 'right': None}
-        self._adaptive_spp_hook_handles = []
-        if getattr(self.feature_neck, 'with_spp', False):
-            num_spp = len(self.feature_neck.spp_branches)
-            self._adaptive_spp_cache = {
-                'left': [None] * num_spp,
-                'right': [None] * num_spp,
-            }
-            for _spp_idx, _spp_branch in enumerate(self.feature_neck.spp_branches):
-                def _capture_spp(module, inputs, output, idx=_spp_idx):
-                    side = self._adaptive_spp_capture_side
-                    if side in ('left', 'right'):
-                        self._adaptive_spp_cache[side][idx] = output.detach()
-                self._adaptive_spp_hook_handles.append(
-                    _spp_branch.register_forward_hook(_capture_spp)
-                )
         if getattr(model_cfg, 'sem_neck', None):
             self.sem_neck = build_neck(model_cfg.sem_neck)
         else:
@@ -160,18 +140,6 @@ class StreamDSGN2Backbone(nn.Module):
         self.voxel_size, self.grid_size = voxel_size, grid_size
         self.prepare_depth(self.point_cloud_range, in_camera_view=False)
         self.prepare_coordinates_3d(self.point_cloud_range, voxel_size, grid_size)
-        # STREAMDSGN_LATENCY_OPT_V1: resident static tensors.
-        for _name in (
-            'downsampled_depth', 'downsampledx2_depth', 'depth', 'coordinates_3d'
-        ):
-            _tensor = getattr(self, _name)
-            delattr(self, _name)
-            self.register_buffer(_name, _tensor.contiguous(), persistent=False)
-            self.register_buffer(
-                f'_adaptive_{_name}_half',
-                _tensor.half().contiguous(),
-                persistent=False,
-            )
         self.max_crop_shape = kwargs.get('max_crop_shape', (320, 1248))
         if self.front_surface_depth:
             crop_x1, crop_x2, crop_y1, crop_y2 = 0, self.max_crop_shape[1], 0, self.max_crop_shape[0]
@@ -374,7 +342,7 @@ class StreamDSGN2Backbone(nn.Module):
 
         # Halo on the layer2/3/4 common 80x312 grid used by
         # local FPN/upconv/lastconv execution.
-        self._adaptive_a_neck_halo = 2
+        self._adaptive_a_neck_halo = 4
 
         # ROI is defined on layer2/3/4 common H/W grid.
         # For current R18 config:
@@ -385,7 +353,11 @@ class StreamDSGN2Backbone(nn.Module):
         #
         # Halo is measured on the corresponding output grid.
         # These are deliberately conservative starting values.
-        self._adaptive_a_halos = {1: 2, 2: 2, 3: 2}
+        self._adaptive_a_halos = {
+            1: 4,   # layer2
+            2: 8,   # layer3, dilation=2
+            3: 16,  # layer4, dilation=4
+        }
 
         self._adaptive_a_last_roi = None
         self._adaptive_a_last_output_roi = None
@@ -618,7 +590,6 @@ class StreamDSGN2Backbone(nn.Module):
         img,
         shallow,
         return_stage_features=False,
-        side=None,
     ):
         """
         Run layer2--4 + the original feature_neck from a full layer1 tensor.
@@ -641,12 +612,7 @@ class StreamDSGN2Backbone(nn.Module):
             x = getattr(bb, layer_name)(x)
             feats.append(x)
 
-        old_side = self._adaptive_spp_capture_side
-        self._adaptive_spp_capture_side = side
-        try:
-            stereo_feature, sem_feature = self.feature_neck([img] + feats)
-        finally:
-            self._adaptive_spp_capture_side = old_side
+        stereo_feature, sem_feature = self.feature_neck([img] + feats)
 
         if return_stage_features:
             return stereo_feature, sem_feature, feats
@@ -856,7 +822,6 @@ class StreamDSGN2Backbone(nn.Module):
                     img,
                     shallow,
                     return_stage_features=True,
-                    side=side,
                 )
 
             self._adaptive_a_cache[side] = [
@@ -886,7 +851,6 @@ class StreamDSGN2Backbone(nn.Module):
                     img,
                     shallow,
                     return_stage_features=True,
-                    side=side,
                 )
 
             self._adaptive_a_cache[side] = [
@@ -1032,7 +996,6 @@ class StreamDSGN2Backbone(nn.Module):
                 feats,
                 base_rect=rect,
                 base_halo=self._adaptive_a_neck_halo,
-                spp_cache=self._adaptive_spp_cache[side],
             )
 
         # Current ROI overwrites the corresponding part of the
@@ -1161,11 +1124,7 @@ class StreamDSGN2Backbone(nn.Module):
             )
 
             left_features = [left] + list(left_backbone_features)
-            self._adaptive_spp_capture_side = 'left'
-            try:
-                left_stereo_feat, left_sem_feat = self.feature_neck(left_features)
-            finally:
-                self._adaptive_spp_capture_side = None
+            left_stereo_feat, left_sem_feat = self.feature_neck(left_features)
 
             # Full frame initializes / refreshes the complete A-stage cache.
             self._capture_adaptive_a_stereo_cache(
@@ -1184,11 +1143,8 @@ class StreamDSGN2Backbone(nn.Module):
                 )
 
                 right_features = [right] + list(right_backbone_features)
-                self._adaptive_spp_capture_side = 'right'
-                try:
-                    right_stereo_feat, right_sem_feat = self.feature_neck(right_features)
-                finally:
-                    self._adaptive_spp_capture_side = None
+                right_stereo_feat, right_sem_feat = \
+                    self.feature_neck(right_features)
 
                 self._capture_adaptive_a_stereo_cache(
                     'right',
@@ -1248,10 +1204,7 @@ class StreamDSGN2Backbone(nn.Module):
         # t1 = time.time()
         if not self.drop_psv:
             # stereo matching: build stereo volume
-            downsampled_depth = (
-                self._adaptive_downsampled_depth_half
-                if self.use_amp else self.downsampled_depth
-            )
+            downsampled_depth = self.downsampled_depth.cuda().half() if self.use_amp else self.downsampled_depth.cuda()
             downsampled_disp = fu_mul_baseline[:, None] / \
                 downsampled_depth[None, :] / (self.downsample_disp if not self.fullres_stereo_feature else 1)
             if left_stereo_feat.shape[1] > self.cv_dim:
@@ -1323,10 +1276,7 @@ class StreamDSGN2Backbone(nn.Module):
         # convert plane-sweep into 3d volume
         # torch.cuda.synchronize()
         # t1 = time.time()
-        coordinates_3d = (
-            self._adaptive_coordinates_3d_half
-            if self.use_amp else self.coordinates_3d
-        )
+        coordinates_3d = self.coordinates_3d.cuda().half() if self.use_amp else self.coordinates_3d.cuda()
         batch_dict['coord'] = coordinates_3d
         norm_coord_imgs = []
         if self.cat_right_img_feature:

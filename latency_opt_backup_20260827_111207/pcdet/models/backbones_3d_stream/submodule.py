@@ -4,8 +4,6 @@ import torch.utils.data
 import torch.nn.functional as F
 from torchvision.ops import DeformConv2d
 
-# STREAMDSGN_LATENCY_OPT_V1
-
 
 def convbn(in_planes,
            out_planes,
@@ -599,8 +597,7 @@ class feature_extraction_neck(nn.Module):
         self,
         feats,
         base_rect,
-        base_halo=2,
-        spp_cache=None,
+        base_halo=4,
     ):
         """
         ROI forward for the stereo output of the current FPN neck.
@@ -713,96 +710,33 @@ class feature_extraction_neck(nn.Module):
         ex1 = min(W, x1 + halo)
 
         # ------------------------------------------------------------
-        # STREAMDSGN_LATENCY_OPT_V1: ROI + persistent low-resolution SPP cache.
+        # Full-context SPP.
+        #
+        # SPP is deliberately kept full because the original module uses
+        # large fixed AvgPool windows. Cropping before SPP changes its
+        # mathematical meaning.
         # ------------------------------------------------------------
         feat_shape = (H, W)
+
         concat_local = [
             x[..., ey0:ey1, ex0:ex1]
             for x in feats[self.start_level:]
         ]
 
         if self.with_spp:
-            if spp_cache is None or len(spp_cache) != len(self.spp_branches):
-                raise RuntimeError(
-                    'ROI SPP cache is missing/uninitialized. '
-                    'Each scene must start from a Full A frame.'
-                )
+            for branch_module in self.spp_branches:
+                spp = branch_module(feats[-1])
 
-            yy = torch.arange(
-                ey0, ey1, device=feats[-1].device, dtype=torch.float32
-            )
-            xx = torch.arange(
-                ex0, ex1, device=feats[-1].device, dtype=torch.float32
-            )
-            gy = torch.zeros_like(yy) if H <= 1 else (2.0 * yy / (H - 1) - 1.0)
-            gx = torch.zeros_like(xx) if W <= 1 else (2.0 * xx / (W - 1) - 1.0)
-            gy, gx = torch.meshgrid(gy, gx, indexing='ij')
-            spp_grid = torch.stack([gx, gy], dim=-1)[None]
-
-            for branch_idx, branch_module in enumerate(self.spp_branches):
-                cache = spp_cache[branch_idx]
-                if cache is None:
-                    raise RuntimeError(
-                        f'ROI SPP cache branch {branch_idx} is uninitialized'
-                    )
-
-                pool = branch_module[0]
-                if not isinstance(pool, nn.AvgPool2d):
-                    raise RuntimeError(
-                        'ROI SPP cache currently supports fixed AvgPool2d only; '
-                        f'got {type(pool).__name__}'
-                    )
-
-                kh, kw = (
-                    pool.kernel_size if isinstance(pool.kernel_size, tuple)
-                    else (pool.kernel_size, pool.kernel_size)
-                )
-                sh, sw = (
-                    pool.stride if isinstance(pool.stride, tuple)
-                    else (pool.stride, pool.stride)
-                )
-                ph, pw = (
-                    pool.padding if isinstance(pool.padding, tuple)
-                    else (pool.padding, pool.padding)
-                )
-                if (ph, pw) != (0, 0) or pool.ceil_mode:
-                    raise RuntimeError(
-                        'ROI SPP cache expects padding=0, ceil_mode=False'
-                    )
-
-                Hs, Ws = cache.shape[-2:]
-                py0 = max(0, y0 // sh)
-                px0 = max(0, x0 // sw)
-                py1 = min(Hs, (y1 + sh - 1) // sh)
-                px1 = min(Ws, (x1 + sw - 1) // sw)
-
-                if py1 > py0 and px1 > px0:
-                    iy0 = py0 * sh
-                    ix0 = px0 * sw
-                    iy1 = (py1 - 1) * sh + kh
-                    ix1 = (px1 - 1) * sw + kw
-
-                    local = feats[-1][..., iy0:iy1, ix0:ix1].contiguous()
-                    local = pool(local)
-                    for sub in list(branch_module.children())[1:]:
-                        local = sub(local)
-
-                    expected = (py1 - py0, px1 - px0)
-                    if tuple(local.shape[-2:]) != expected:
-                        raise RuntimeError(
-                            f'ROI SPP local shape mismatch: '
-                            f'got={tuple(local.shape[-2:])}, expected={expected}'
-                        )
-                    cache[..., py0:py1, px0:px1].copy_(local)
-
-                spp_local = F.grid_sample(
-                    cache,
-                    spp_grid.to(dtype=cache.dtype),
+                spp = F.interpolate(
+                    spp,
+                    feat_shape,
                     mode='bilinear',
-                    padding_mode='border',
                     align_corners=True,
                 )
-                concat_local.append(spp_local)
+
+                concat_local.append(
+                    spp[..., ey0:ey1, ex0:ex1]
+                )
 
         x = torch.cat(concat_local, dim=1).contiguous()
 

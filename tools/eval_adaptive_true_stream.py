@@ -43,6 +43,8 @@ the provisional LUT affects only which action the scheduler chooses.
 """
 
 import argparse
+
+# STREAMDSGN_LATENCY_OPT_V1
 import copy
 import csv
 import json
@@ -118,8 +120,8 @@ def parse_args():
 
     p.add_argument("--levels", default="0.15,0.25,0.40,0.60,0.80")
     p.add_argument("--roi_align", type=int, default=4)
-    p.add_argument("--b_halo", type=int, default=1)
-    p.add_argument("--cd_halo", type=int, default=12)
+    p.add_argument("--b_halo", type=int, default=2)
+    p.add_argument("--cd_halo", type=int, default=2)
     p.add_argument("--pred_margin", type=int, default=12)
     p.add_argument("--age_cap", type=float, default=8.0)
 
@@ -396,25 +398,25 @@ def expand_align(rect, halo, H, W, align):
 
 
 def stage_plan_gpu(q, levels, align):
-    """Return GPU scalar max-window values/indices plus static ROI metadata."""
+    # STREAMDSGN_LATENCY_OPT_V1: one integral image per Q map.
     if q.ndim != 4 or q.shape[0] != 1 or q.shape[1] != 1:
         raise RuntimeError(f"Expected Q [1,1,H,W], got {tuple(q.shape)}")
-
     H, W = q.shape[-2:]
+    qf = q.float()
+    integ = F.pad(qf, (1, 0, 1, 0), mode="constant", value=0.0)
+    integ = integ.cumsum(dim=-2).cumsum(dim=-1)
     plans = []
     for level, ratio in enumerate(levels):
         h, w = roi_hw_from_ratio(H, W, ratio, align=align)
-        score = F.avg_pool2d(q, kernel_size=(h, w), stride=1) * float(h * w)
+        score = (
+            integ[..., h:, w:] - integ[..., :-h, w:]
+            - integ[..., h:, :-w] + integ[..., :-h, :-w]
+        )
         flat = score.flatten(1)
         value, idx = flat.max(dim=1)
         plans.append({
-            "level": level,
-            "ratio": float(ratio),
-            "h": int(h),
-            "w": int(w),
-            "Wv": int(score.shape[-1]),
-            "value_gpu": value[0],
-            "idx_gpu": idx[0],
+            "level": level, "ratio": float(ratio), "h": int(h), "w": int(w),
+            "Wv": int(score.shape[-1]), "value_gpu": value[0], "idx_gpu": idx[0],
         })
     return plans
 
@@ -510,6 +512,77 @@ class DeadlineScheduler:
 
     def full_fits(self, deadline_ms):
         return self.full_safe_ms <= float(deadline_ms)
+
+    def choose_gpu(self, gpu_plans, deadline_ms):
+        # STREAMDSGN_LATENCY_OPT_V1: GPU 5x5x5 scheduler.
+        device = gpu_plans["A"][0]["value_gpu"].device
+        K = len(self.levels)
+        if not hasattr(self, "_latency_lut_cpu"):
+            vals = []
+            for a in range(K):
+                for b in range(K):
+                    for cd in range(K):
+                        vals.append(float(self.actions[f"{a},{b},{cd}"]["safe_ms"]) + self.extra_ms)
+            self._latency_lut_cpu = torch.tensor(vals, dtype=torch.float32).view(K, K, K)
+            self._latency_lut_gpu = None
+            self._latency_lut_device = None
+        if self._latency_lut_gpu is None or self._latency_lut_device != device:
+            self._latency_lut_gpu = self._latency_lut_cpu.to(device=device)
+            self._latency_lut_device = device
+
+        ua = torch.stack([x["value_gpu"].float() for x in gpu_plans["A"]])
+        ub = torch.stack([x["value_gpu"].float() for x in gpu_plans["B"]])
+        uc = torch.stack([x["value_gpu"].float() for x in gpu_plans["CD"]])
+        util = self.lambda_a * ua[:, None, None] + self.lambda_b * ub[None, :, None] + self.lambda_cd * uc[None, None, :]
+        lat = self._latency_lut_gpu
+        feasible = lat <= float(deadline_ms)
+        feasible_count = feasible.sum()
+        no_feasible = feasible_count == 0
+        masked = util.masked_fill(~feasible, -float("inf"))
+        max_utility = masked.max()
+        # Preserve the old scheduler's latency tie-break among actions with
+        # the same maximum utility.
+        best_utility_mask = feasible & (util >= max_utility - 1e-12)
+        tie_lat = lat.masked_fill(~best_utility_mask, float("inf"))
+        best_flat = tie_lat.reshape(-1).argmin()
+        fastest_flat = lat.reshape(-1).argmin()
+        best_flat = torch.where(no_feasible, fastest_flat, best_flat)
+
+        a_gpu = best_flat // (K * K)
+        rem = best_flat % (K * K)
+        b_gpu = rem // K
+        cd_gpu = rem % K
+        idx_a = torch.stack([x["idx_gpu"] for x in gpu_plans["A"]])[a_gpu]
+        idx_b = torch.stack([x["idx_gpu"] for x in gpu_plans["B"]])[b_gpu]
+        idx_c = torch.stack([x["idx_gpu"] for x in gpu_plans["CD"]])[cd_gpu]
+
+        selected_lat = lat[a_gpu, b_gpu, cd_gpu]
+        selected_util = util[a_gpu, b_gpu, cd_gpu]
+        packed = torch.stack([
+            a_gpu.float(), b_gpu.float(), cd_gpu.float(),
+            idx_a.float(), idx_b.float(), idx_c.float(),
+            feasible_count.float(), no_feasible.float(),
+            selected_lat.float(), selected_util.float(),
+        ]).detach().cpu().tolist()
+        a, b, cd, ia, ib, ic, nfeas, nofeas = [int(x) for x in packed[:8]]
+        selected_lat_cpu = float(packed[8])
+        selected_util_cpu = float(packed[9])
+
+        def _plan(stage, level, idx):
+            rec = gpu_plans[stage][level]
+            y0 = idx // rec["Wv"]
+            x0 = idx % rec["Wv"]
+            return {
+                "level": level, "ratio": rec["ratio"], "h": rec["h"], "w": rec["w"],
+                "rect": (y0, y0 + rec["h"], x0, x0 + rec["w"]),
+            }
+
+        return {
+            "key": f"{a},{b},{cd}", "a": a, "b": b, "cd": cd,
+            "estimated_safe_ms": selected_lat_cpu,
+            "utility": selected_util_cpu,
+            "feasible_count": nfeas, "no_feasible_action": bool(nofeas),
+        }, {"A": _plan("A", a, ia), "B": _plan("B", b, ib), "CD": _plan("CD", cd, ic)}
 
     def choose(self, plans, deadline_ms):
         best = None
@@ -895,6 +968,7 @@ class AdaptiveEngine:
                 feats,
                 base_rect=rect,
                 base_halo=bb._adaptive_a_neck_halo,
+                spp_cache=bb._adaptive_spp_cache[side],
             )
             bb._adaptive_a_update_dense_cache(
                 stereo_cache, stereo_patch, output_rect
@@ -926,9 +1000,7 @@ class AdaptiveEngine:
             # Match stream_dsgn2_backbone.py literally:
             #   self.downsampled_depth.cuda().half() if use_amp else .cuda()
             downsampled_depth = (
-                bb.downsampled_depth.cuda().half()
-                if bb.use_amp
-                else bb.downsampled_depth.cuda()
+                bb._adaptive_downsampled_depth_half if bb.use_amp else bb.downsampled_depth
             )
 
             shift = (
@@ -1000,9 +1072,9 @@ class AdaptiveEngine:
         cy0, cy1, cx0, cx1 = rect
         ey0, ey1, ex0, ex1 = e
 
-        coordinates_3d = bb.coordinates_3d.to(device="cuda")
-        if bb.use_amp:
-            coordinates_3d = coordinates_3d.half()
+        coordinates_3d = (
+            bb._adaptive_coordinates_3d_half if bb.use_amp else bb.coordinates_3d
+        )
 
         calib = token["calib"][0]
         tensor_dtype = torch.float16 if bb.use_amp else torch.float32
@@ -1091,15 +1163,14 @@ class AdaptiveEngine:
                 "CD": stage_plan_gpu(imp["q_cd"], self.levels, self.roi_align),
             }
 
-        plans = finalize_stage_plans(gpu_plans)
-        choice = self.scheduler.choose(plans, deadline_ms)
+        choice, selected_plans = self.scheduler.choose_gpu(gpu_plans, deadline_ms)
 
         a = choice["a"]
         b = choice["b"]
         cd = choice["cd"]
-        a_rect = plans["A"][a]["rect"]
-        b_rect = plans["B"][b]["rect"]
-        cd_rect = plans["CD"][cd]["rect"]
+        a_rect = selected_plans["A"]["rect"]
+        b_rect = selected_plans["B"]["rect"]
+        cd_rect = selected_plans["CD"]["rect"]
 
         # ------------------------------------------------------------
         # Physical A_d from the already-computed A_s.
@@ -1328,9 +1399,7 @@ def self_check_physical_bcd(
     full_rect = (0, H, 0, W)
 
     coordinates_3d = (
-        bb.coordinates_3d.cuda().half()
-        if bb.use_amp
-        else bb.coordinates_3d.cuda()
+        bb._adaptive_coordinates_3d_half if bb.use_amp else bb.coordinates_3d
     )
 
     calib = token["calib"][0]

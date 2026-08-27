@@ -4,8 +4,6 @@
 import torch
 from torch import nn
 
-# STREAMDSGN_LATENCY_OPT_V1
-
 from pcdet.ops.build_cost_volume import build_cost_volume
 from pcdet.ops.build_dps_cost_volume import build_dps_cost_volume, build_dps_cost_volume_roi
 
@@ -75,11 +73,14 @@ class BuildCostVolume(nn.Module):
         i.e. H=80, W=312 in the current configuration.
         """
 
-        # STREAMDSGN_LATENCY_OPT_V1: ROI CUDA accepts FP16 directly.
-        if left.dtype != right.dtype or left.dtype != shift.dtype:
-            raise RuntimeError(
-                f'DPS ROI dtype mismatch: left={left.dtype}, right={right.dtype}, shift={shift.dtype}'
-            )
+        if left.dtype == torch.float16:
+            left = left.float()
+
+        if right.dtype == torch.float16:
+            right = right.float()
+
+        if shift.dtype == torch.float16:
+            shift = shift.float()
 
         volumes = []
 
