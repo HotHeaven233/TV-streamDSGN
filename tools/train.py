@@ -35,9 +35,21 @@ def parse_config():
     parser.add_argument('--max_waiting_mins', type=int, default=0, help='max waiting minutes')
     parser.add_argument('--save_to_file', action='store_true', default=False, help='')
     # loading options
-    parser.add_argument('--ckpt', type=str, default=None, help='checkpoint to start from')
+    parser.add_argument('--ckpt', type=str, default=None, help='checkpoint to resume from')
+    parser.add_argument(
+        '--pretrained_model',
+        type=str,
+        default=None,
+        help='partially load matching model weights before training'
+    )
     parser.add_argument('--start_epoch', type=int, default=0, help='')
     parser.add_argument('--continue_train', action='store_true', default=False)
+    parser.add_argument(
+        '--train_mh_adapter_only',
+        action='store_true',
+        default=False,
+        help='freeze original StreamDSGN and train only the multi-history residual adapter'
+    )
     # distributed options
     parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm'], default='none')
     parser.add_argument('--tcp_port', type=int, default=18888, help='tcp port for distrbuted training')
@@ -136,6 +148,85 @@ def main():
         else:
             logger.info('Closed Synchronized BN as dist_train == False.')
     model.cuda()
+
+    # Partial checkpoint loading for architecture extension.
+    #
+    # Unlike --ckpt, this only loads parameters whose names and shapes match.
+    # This allows the original StreamDSGN checkpoint to initialize the
+    # multi-history model while leaving multi_history_fusion at its
+    # identity-to-original-FFF initialization.
+    if args.pretrained_model is not None:
+        logger.info(
+            'Loading pretrained model with partial parameter matching: %s'
+            % args.pretrained_model
+        )
+        model.load_params_from_file(
+            filename=args.pretrained_model,
+            logger=logger,
+            to_cpu=True
+        )
+
+
+    # MH_ADAPTER_ONLY_FREEZE_BEGIN
+    if args.train_mh_adapter_only:
+
+        trainable_keywords = (
+            'history_adapter_proj',
+            'history_adapter_fusion',
+        )
+
+        trainable_names = []
+
+        for name, param in model.named_parameters():
+
+            train_this = any(
+                key in name
+                for key in trainable_keywords
+            )
+
+            param.requires_grad = train_this
+
+            if train_this:
+                trainable_names.append(name)
+
+        if len(trainable_names) == 0:
+            raise RuntimeError(
+                'train_mh_adapter_only was requested, '
+                'but no adapter parameters were found.'
+            )
+
+        model._train_mh_adapter_only = True
+
+        trainable_num = sum(
+            p.numel()
+            for p in model.parameters()
+            if p.requires_grad
+        )
+
+        total_num = sum(
+            p.numel()
+            for p in model.parameters()
+        )
+
+        logger.info(
+            '============================================================'
+        )
+        logger.info(
+            'Multi-History residual adapter-only training'
+        )
+        logger.info(
+            f'Trainable parameters: {trainable_num:,} / {total_num:,}'
+        )
+
+        for name in trainable_names:
+            logger.info(
+                f'  TRAINABLE: {name}'
+            )
+
+        logger.info(
+            '============================================================'
+        )
+    # MH_ADAPTER_ONLY_FREEZE_END
 
     optimizer = build_optimizer(model, cfg.OPTIMIZATION)
 

@@ -2,6 +2,7 @@ import glob
 import os
 
 import torch
+import torch.nn as nn
 import tqdm
 from torch.nn.utils import clip_grad_norm_
 import torch.distributed as dist
@@ -37,6 +38,34 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
             tb_log.add_scalar('meta_data/learning_rate', cur_lr, accumulated_iter)
 
         model.train()
+
+        # MH_ADAPTER_ONLY_FREEZE_BN
+        #
+        # Base StreamDSGN weights are frozen during adapter-only training.
+        # BatchNorm running statistics are mutable state even when
+        # requires_grad=False, so keep all BN layers in eval mode.
+        #
+        # The new history adapter intentionally contains no BN.
+        base_model = (
+            model.module
+            if hasattr(model, 'module')
+            else model
+        )
+
+        if getattr(
+            base_model,
+            '_train_mh_adapter_only',
+            False
+        ):
+            for _, module in (
+                base_model.named_modules()
+            ):
+                if isinstance(
+                    module,
+                    nn.modules.batchnorm._BatchNorm
+                ):
+                    module.eval()
+
         optimizer.zero_grad()
 
         def print_grad_status(model):
