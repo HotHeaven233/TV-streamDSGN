@@ -30,6 +30,13 @@ class StreamDSGN2Backbone(nn.Module):
         self.mono = getattr(model_cfg, 'mono', False)
         self.maxdisp = model_cfg.maxdisp
         self.downsample_disp = model_cfg.downsample_disp
+        self.stereo_depth_stride = int(
+            getattr(
+                model_cfg,
+                'stereo_depth_stride',
+                self.downsample_disp,
+            )
+        )
         self.voxel_occupancy_downsample_disp = getattr(model_cfg, 'voxel_occupancy_downsample_disp', self.downsample_disp)
         self.downsampled_depth_offset = model_cfg.downsampled_depth_offset
         self.num_hg = getattr(model_cfg, 'num_hg', 1)
@@ -74,7 +81,10 @@ class StreamDSGN2Backbone(nn.Module):
 
         if not self.drop_psv:
             # cost volume
-            self.build_cost = BuildCostVolume(model_cfg.cost_volume)
+            self.build_cost = BuildCostVolume(
+                model_cfg.cost_volume,
+                default_channels=self.cv_dim,
+            )
 
             # stereo network
             CV_INPUT_DIM = self.build_cost.get_dim(self.feature_neck.stereo_dim[-1]) if not self.mono else self.cv_dim
@@ -185,7 +195,15 @@ class StreamDSGN2Backbone(nn.Module):
             convbn_3d(cv_dim, cv_dim, 3, 1, 1, gn=self.GN and cv_dim>=32),
             nn.ReLU(inplace=True),
             nn.Conv3d(cv_dim, 1, 3, 1, 1, bias=True),
-            nn.Upsample(scale_factor=self.downsample_disp, mode='trilinear', align_corners=True))
+            nn.Upsample(
+                scale_factor=(
+                    self.stereo_depth_stride,
+                    self.downsample_disp,
+                    self.downsample_disp,
+                ),
+                mode='trilinear',
+                align_corners=True,
+            ))
 
     def build_voxel_pred_module(self, upsample_ratio=(2,2,2), voxel_pred_convs=1, voxel_pred_hgs=0):
         voxel_module = []
@@ -217,10 +235,10 @@ class StreamDSGN2Backbone(nn.Module):
                                                                         self.CV_DEPTH_MAX, depth_interval))
         # prepare downsampled depth
         self.downsampled_depth = torch.zeros(
-            (self.maxdisp // self.downsample_disp), dtype=torch.float32)
-        for i in range(self.maxdisp // self.downsample_disp):
+            (self.maxdisp // self.stereo_depth_stride), dtype=torch.float32)
+        for i in range(self.maxdisp // self.stereo_depth_stride):
             self.downsampled_depth[i] = (
-                i + self.downsampled_depth_offset) * self.downsample_disp * depth_interval + self.CV_DEPTH_MIN
+                i + self.downsampled_depth_offset) * self.stereo_depth_stride * depth_interval + self.CV_DEPTH_MIN
         self.downsampledx2_depth = torch.zeros(
             (self.maxdisp // 2), dtype=torch.float32)
         for i in range(self.maxdisp // 2):
@@ -256,17 +274,122 @@ class StreamDSGN2Backbone(nn.Module):
         coordinates_3d = torch.stack([xs, ys, zs], dim=-1)
         self.coordinates_3d = coordinates_3d.float()
 
-    def prepare_coordinates_psv(self, crop_x1, crop_x2, crop_y1, crop_y2, img_height, img_width, downsample_disp):
-        us = torch.linspace(crop_y1 + 0.5 * downsample_disp[0], crop_y2 - 0.5 * downsample_disp[0], img_height // downsample_disp[0], dtype=torch.float32, device='cuda') # height
-        vs = torch.linspace(crop_x1 + 0.5 * downsample_disp[1], crop_x2 - 0.5 * downsample_disp[1], img_width // downsample_disp[1], dtype=torch.float32, device='cuda') # width 
-        if downsample_disp[2] == 4:
-            ds = self.downsampled_depth.cuda()
-        elif downsample_disp[2] == 2:
-            ds = self.downsampledx2_depth.cuda()
-        elif downsample_disp[2] == 1:
+    def prepare_coordinates_psv(
+        self,
+        crop_x1,
+        crop_x2,
+        crop_y1,
+        crop_y2,
+        img_height,
+        img_width,
+        downsample_disp,
+    ):
+        spatial_ds_h = int(
+            downsample_disp[0]
+        )
+        spatial_ds_w = int(
+            downsample_disp[1]
+        )
+        depth_ds = int(
+            downsample_disp[2]
+        )
+
+        us = torch.linspace(
+            crop_y1 + 0.5 * spatial_ds_h,
+            crop_y2 - 0.5 * spatial_ds_h,
+            img_height // spatial_ds_h,
+            dtype=torch.float32,
+            device='cuda',
+        )
+
+        vs = torch.linspace(
+            crop_x1 + 0.5 * spatial_ds_w,
+            crop_x2 - 0.5 * spatial_ds_w,
+            img_width // spatial_ds_w,
+            dtype=torch.float32,
+            device='cuda',
+        )
+
+        # Main path:
+        #
+        # Full:
+        #   self.downsample_disp = 4 -> 64 depth bins
+        #
+        # Light:
+        #   self.downsample_disp = 8 -> 32 depth bins
+        #
+        # `self.downsampled_depth` is already generated according
+        # to self.downsample_disp, so reuse it whenever possible.
+        if depth_ds == self.downsample_disp:
+
+            ds = (
+                self.downsampled_depth.cuda()
+            )
+
+        elif depth_ds == 2:
+
+            ds = (
+                self.downsampledx2_depth.cuda()
+            )
+
+        elif depth_ds == 1:
+
             ds = self.depth.cuda()
-        ds, us, vs = torch.meshgrid(ds, us, vs)
-        coordinates_psv = torch.stack([vs, us, ds], dim=-1)
+
+        else:
+
+            if (
+                self.maxdisp
+                %
+                depth_ds
+                !=
+                0
+            ):
+                raise ValueError(
+                    "maxdisp must be divisible by "
+                    f"depth downsample factor: "
+                    f"{self.maxdisp} vs {depth_ds}"
+                )
+
+            depth_interval = (
+                self.CV_DEPTH_MAX
+                -
+                self.CV_DEPTH_MIN
+            ) / self.maxdisp
+
+            ds = (
+                (
+                    torch.arange(
+                        self.maxdisp // depth_ds,
+                        dtype=torch.float32,
+                        device='cuda',
+                    )
+                    +
+                    self.downsampled_depth_offset
+                )
+                *
+                depth_ds
+                *
+                depth_interval
+                +
+                self.CV_DEPTH_MIN
+            )
+
+        ds, us, vs = torch.meshgrid(
+            ds,
+            us,
+            vs,
+        )
+
+        coordinates_psv = torch.stack(
+            [
+                vs,
+                us,
+                ds,
+            ],
+            dim=-1,
+        )
+
         return coordinates_psv
 
     def init_params(self):

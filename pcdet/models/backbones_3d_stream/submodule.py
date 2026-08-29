@@ -532,7 +532,10 @@ class feature_extraction_neck(nn.Module):
                                                          128, 32, 32], final_channels=(self.stereo_dim[-2], self.stereo_dim[-1]), share_upconv=self.share_upconv)
             else:
                 raise ValueError('Invalid upconv type.')
-            stereo_dim = 32
+            # The FPN output width is configurable.
+            # Full default: up_dims=[64, 32] -> 32
+            # Light-v1   : up_dims=[32, 16] -> 16
+            stereo_dim = self.up_dims[-1]
         else:
             stereo_dim = concat_dim
             assert self.start_level >= 1
