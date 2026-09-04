@@ -50,6 +50,12 @@ def parse_config():
         default=False,
         help='freeze original StreamDSGN and train only the multi-history residual adapter'
     )
+    parser.add_argument(
+        '--train_mtd_head_only',
+        action='store_true',
+        default=False,
+        help='freeze Original StreamDSGN and train only the selected MTD future-timestep dense head'
+    )
     # distributed options
     parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm'], default='none')
     parser.add_argument('--tcp_port', type=int, default=18888, help='tcp port for distrbuted training')
@@ -228,6 +234,88 @@ def main():
         )
     # MH_ADAPTER_ONLY_FREEZE_END
 
+    # MTD_HEAD_ONLY_FREEZE_BEGIN
+    if args.train_mtd_head_only:
+
+        if args.train_mh_adapter_only:
+            raise RuntimeError(
+                '--train_mtd_head_only and '
+                '--train_mh_adapter_only '
+                'cannot be enabled together'
+            )
+
+        trainable_names = []
+
+        for name, param in (
+            model.named_parameters()
+        ):
+            train_this = (
+                name == 'dense_head'
+                or
+                name.startswith(
+                    'dense_head.'
+                )
+            )
+
+            param.requires_grad = (
+                train_this
+            )
+
+            if train_this:
+                trainable_names.append(
+                    name
+                )
+
+        if len(
+            trainable_names
+        ) == 0:
+            raise RuntimeError(
+                'no dense_head parameters found'
+            )
+
+        model._train_mtd_head_only = True
+
+        trainable_num = sum(
+            p.numel()
+            for p in model.parameters()
+            if p.requires_grad
+        )
+
+        total_num = sum(
+            p.numel()
+            for p in model.parameters()
+        )
+
+        logger.info(
+            '============================================================'
+        )
+
+        logger.info(
+            'MTD future-timestep '
+            'dense-head-only training'
+        )
+
+        logger.info(
+            f'Trainable parameters: '
+            f'{trainable_num:,} / '
+            f'{total_num:,}'
+        )
+
+        logger.info(
+            'MTD supervision: '
+            f'{cfg.MODEL.DENSE_HEAD.BOX3D_SUPERVISION}'
+        )
+
+        for name in trainable_names:
+            logger.info(
+                f'  TRAINABLE: {name}'
+            )
+
+        logger.info(
+            '============================================================'
+        )
+    # MTD_HEAD_ONLY_FREEZE_END
+
     optimizer = build_optimizer(model, cfg.OPTIMIZATION)
 
     # load checkpoint if it is possible
@@ -287,6 +375,14 @@ def main():
             logger=logger
         )
         logger.info('*******End training: {} ********'.format(output_dir))
+
+    if args.train_mtd_head_only:
+        logger.info(
+            'MTD head-only training finished. '
+            'Skip standard token-time evaluation: '
+            'h=2/h=3 require future-timestamp evaluation.'
+        )
+        return
 
     model.eval()
 

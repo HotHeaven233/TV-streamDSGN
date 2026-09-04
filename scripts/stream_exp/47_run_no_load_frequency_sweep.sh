@@ -36,6 +36,8 @@ SUMMARY_ROOT="outputs/no_load_frequency_sweep"
 mkdir -p "${SUMMARY_ROOT}"
 
 for f in \
+    "${ORIGINAL_CFG}" \
+    "${ORIGINAL_CKPT}" \
     "${FULL_CFG}" \
     "${FULL_CKPT}" \
     "${RAW_CKPT}" \
@@ -115,8 +117,8 @@ do
     echo "===================================================================================================="
 
     python "${ORI_EVAL}" \
-        --cfg "${FULL_CFG}" \
-        --ckpt "${FULL_CKPT}" \
+        --cfg "${ORIGINAL_CFG}" \
+        --ckpt "${ORIGINAL_CKPT}" \
         --levels_json "${LEVELS_JSON}" \
         --pressure_level "L0" \
         --pressure_fraction 0.0 \

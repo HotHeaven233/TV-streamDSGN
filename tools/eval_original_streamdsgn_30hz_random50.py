@@ -1303,6 +1303,15 @@ def main():
             "method":
                 "Original StreamDSGN",
 
+            "base_detector":
+                "vanilla_streamdsgn",
+
+            "model_cfg":
+                str(args.cfg),
+
+            "model_ckpt":
+                str(args.ckpt),
+
             "input_hz":
                 args.input_hz,
 

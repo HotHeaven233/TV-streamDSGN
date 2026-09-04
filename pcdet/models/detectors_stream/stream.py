@@ -130,6 +130,40 @@ class STREAM(StreamDetector3DTemplate):
         loss = 0.
         tb_dict = {}
 
+        # MTD_HEAD_ONLY_LOSS_BEGIN
+        if getattr(
+            self,
+            '_train_mtd_head_only',
+            False
+        ):
+            if getattr(
+                self,
+                'dense_head',
+                None
+            ) is None:
+                raise RuntimeError(
+                    'MTD head-only training '
+                    'requires dense_head'
+                )
+
+            loss_rpn, tb_dict = (
+                self.dense_head.get_loss(
+                    batch_dict,
+                    tb_dict
+                )
+            )
+
+            tb_dict.update(
+                loss_rpn=loss_rpn.item()
+            )
+
+            return (
+                loss_rpn,
+                tb_dict,
+                disp_dict,
+            )
+        # MTD_HEAD_ONLY_LOSS_END
+
         if getattr(self, 'dense_head_2d', None):
             loss_rpn_2d, tb_dict = self.dense_head_2d.get_loss(
                 batch_dict, tb_dict)

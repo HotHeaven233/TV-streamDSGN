@@ -47,6 +47,7 @@ class StereoKittiStreaming(StereoStreamingTemplate):
             self.sample_id_list = json.load(f)
         self.kitti_infos = []
         self.include_kitti_data(self.mode)
+        self._maybe_add_mtd_future_tags()
 
     def include_kitti_data(self, mode):
         if self.logger is not None:
@@ -68,6 +69,199 @@ class StereoKittiStreaming(StereoStreamingTemplate):
         if self.logger is not None:
             self.logger.info('Total samples for KITTI dataset: %d' %
                              (len(kitti_infos)))
+
+    def _maybe_add_mtd_future_tags(self):
+        """
+        Add next2 / next3 metadata for MTD head training.
+        The future chain is followed strictly inside one scene.
+        """
+        steps = self.dataset_cfg.get(
+            'MTD_FUTURE_STEPS',
+            []
+        )
+
+        if steps is None:
+            return
+
+        steps = sorted(
+            set(
+                int(x)
+                for x in steps
+            )
+        )
+
+        if len(steps) == 0:
+            return
+
+        if any(
+            x < 2
+            for x in steps
+        ):
+            raise ValueError(
+                'MTD_FUTURE_STEPS must '
+                f'contain integers >= 2: {steps}'
+            )
+
+        lookup = {}
+
+        for item in self.kitti_infos:
+            scene = str(
+                item[
+                    'sample_idx'
+                ][
+                    'scene'
+                ]
+            )
+
+            token = (
+                item[
+                    'sample_idx'
+                ][
+                    'frame_tag'
+                ].get(
+                    'token',
+                    ''
+                )
+            )
+
+            if token == '':
+                continue
+
+            key = (
+                scene,
+                str(token),
+            )
+
+            if key in lookup:
+                raise RuntimeError(
+                    f'duplicate MTD token: {key}'
+                )
+
+            lookup[key] = item
+
+        valid_count = {
+            step: 0
+            for step in steps
+        }
+
+        invalid_count = {
+            step: 0
+            for step in steps
+        }
+
+        max_step = max(
+            steps
+        )
+
+        for item in self.kitti_infos:
+
+            scene = str(
+                item[
+                    'sample_idx'
+                ][
+                    'scene'
+                ]
+            )
+
+            frame_tags = (
+                item[
+                    'sample_idx'
+                ][
+                    'frame_tag'
+                ]
+            )
+
+            cur_info = item
+
+            for step in range(
+                1,
+                max_step + 1,
+            ):
+                next_id = (
+                    cur_info[
+                        'sample_idx'
+                    ][
+                        'frame_tag'
+                    ].get(
+                        'next',
+                        ''
+                    )
+                )
+
+                if (
+                    next_id is None
+                    or
+                    str(next_id) == ''
+                ):
+                    break
+
+                next_key = (
+                    scene,
+                    str(next_id),
+                )
+
+                next_info = lookup.get(
+                    next_key,
+                    None,
+                )
+
+                if next_info is None:
+                    break
+
+                if step in steps:
+                    tag = (
+                        f'next{step}'
+                    )
+
+                    frame_tags[
+                        tag
+                    ] = str(
+                        next_id
+                    )
+
+                    item[
+                        'infos'
+                    ][
+                        tag
+                    ] = copy.deepcopy(
+                        next_info[
+                            'infos'
+                        ][
+                            'token'
+                        ]
+                    )
+
+                    valid_count[
+                        step
+                    ] += 1
+
+                cur_info = next_info
+
+            for step in steps:
+                tag = (
+                    f'next{step}'
+                )
+
+                if tag not in frame_tags:
+                    frame_tags[
+                        tag
+                    ] = ''
+
+                    invalid_count[
+                        step
+                    ] += 1
+
+        if self.logger is not None:
+            self.logger.info(
+                'MTD future tags: '
+                +
+                ', '.join(
+                    f'next{step}: '
+                    f'valid={valid_count[step]}, '
+                    f'invalid={invalid_count[step]}'
+                    for step in steps
+                )
+            )
 
     def set_split(self, split):
         super().__init__(

@@ -66,6 +66,38 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                 ):
                     module.eval()
 
+        # MTD_HEAD_ONLY_FREEZE_BN
+        if getattr(
+            base_model,
+            '_train_mtd_head_only',
+            False
+        ):
+            for name, module in (
+                base_model.named_modules()
+            ):
+                if (
+                    name == 'dense_head'
+                    or
+                    name.startswith(
+                        'dense_head.'
+                    )
+                ):
+                    continue
+
+                module.eval()
+
+            if getattr(
+                base_model,
+                'dense_head',
+                None
+            ) is None:
+                raise RuntimeError(
+                    'MTD head-only training '
+                    'requires dense_head'
+                )
+
+            base_model.dense_head.train()
+
         optimizer.zero_grad()
 
         def print_grad_status(model):

@@ -13,13 +13,19 @@ PRESSURE_FRACTION="${6:-0.5}"
 
 EXP_NAME="${ELASTIC_EXP_NAME:-elastic_bev_v4_bn_from_k3}"
 
+# This baseline MUST use the untouched/vanilla StreamDSGN model.
+if [ "${ORIGINAL_CFG}" = "${FULL_CFG}" ] || [ "${ORIGINAL_CKPT}" = "${FULL_CKPT}" ]; then
+    echo "[ERROR] ORIGINAL_* unexpectedly equals FULL_*"
+    exit 20
+fi
+
 LEVELS_JSON="outputs/elastic_bev/${EXP_NAME}/contention_calibration_v6/smooth_microchain_priority/contention_levels.json"
 
 OUT_ROOT="outputs/original_streamdsgn/formal_streaming_random50/${HZ}Hz_forward_only_seed${TRACE_SEED}"
 
 for f in \
-    "${FULL_CFG}" \
-    "${FULL_CKPT}" \
+    "${ORIGINAL_CFG}" \
+    "${ORIGINAL_CKPT}" \
     "${LEVELS_JSON}" \
     "tools/eval_original_streamdsgn_30hz_random50.py" \
     "tools/eval_tv_stream3d_30hz_random50.py" \
@@ -58,8 +64,8 @@ do
     echo "===================================================================================================="
     echo "ORIGINAL StreamDSGN RANDOM CONTENTION"
     echo "===================================================================================================="
-    echo "cfg               : ${FULL_CFG}"
-    echo "ckpt              : ${FULL_CKPT}"
+    echo "cfg               : ${ORIGINAL_CFG}"
+    echo "ckpt              : ${ORIGINAL_CKPT}"
     echo "input Hz          : ${HZ}"
     echo "trace             : L0 + ${pressure}"
     echo "pressure fraction : ${PRESSURE_FRACTION}"
@@ -70,8 +76,8 @@ do
     echo "===================================================================================================="
 
     python tools/eval_original_streamdsgn_30hz_random50.py \
-        --cfg "${FULL_CFG}" \
-        --ckpt "${FULL_CKPT}" \
+        --cfg "${ORIGINAL_CFG}" \
+        --ckpt "${ORIGINAL_CKPT}" \
         --levels_json "${LEVELS_JSON}" \
         --pressure_level "${pressure}" \
         --pressure_fraction "${PRESSURE_FRACTION}" \
