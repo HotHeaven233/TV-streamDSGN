@@ -8,7 +8,11 @@ def build_network(model_cfg, num_class, dataset):
     # This avoids importing unrelated LiDAR/spconv modules.
     if model_cfg['NAME'].startswith('stereo'):
         from .detectors_stereo import build_detector
-    elif model_cfg['NAME'].startswith('stream'):
+    elif (
+        model_cfg['NAME'].startswith('stream')
+        or
+        model_cfg['NAME'].startswith('transtreaming')
+    ):
         from .detectors_stream import build_detector
     else:
         from .detectors_lidar import build_detector

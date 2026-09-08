@@ -67,25 +67,24 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                     module.eval()
 
         # MTD_HEAD_ONLY_FREEZE_BN
+        #
+        # IMPORTANT:
+        # Do NOT call eval() on the root STREAM model here.
+        #
+        # STREAM.mode is derived from base_model.training:
+        #
+        #     TRAIN if self.training else TEST
+        #
+        # Calling base_model.eval() would therefore make
+        # STREAM.forward() dispatch to forward_test(), even if
+        # dense_head.train() is called afterwards.
+        #
+        # We only put the NON-DENSE-HEAD children into eval mode.
         if getattr(
             base_model,
             '_train_mtd_head_only',
             False
         ):
-            for name, module in (
-                base_model.named_modules()
-            ):
-                if (
-                    name == 'dense_head'
-                    or
-                    name.startswith(
-                        'dense_head.'
-                    )
-                ):
-                    continue
-
-                module.eval()
-
             if getattr(
                 base_model,
                 'dense_head',
@@ -96,7 +95,68 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                     'requires dense_head'
                 )
 
+            # ----------------------------------------------------
+            # Freeze runtime state of the shared K3 trunk.
+            #
+            # named_children(), unlike named_modules(), does NOT
+            # include the root STREAM model itself.
+            # ----------------------------------------------------
+            for name, module in (
+                base_model.named_children()
+            ):
+                if name == 'dense_head':
+                    continue
+
+                module.eval()
+
+            # ----------------------------------------------------
+            # The detector root MUST remain in TRAIN mode so
+            # STREAM.forward() -> forward_train().
+            #
+            # Do not call base_model.train(True) here because that
+            # would recursively re-enable training mode in the
+            # frozen shared trunk.
+            # ----------------------------------------------------
+            base_model.training = True
+
+            # Only H2/H3 dense head is train-mode/trainable.
             base_model.dense_head.train()
+
+            # ----------------------------------------------------
+            # Structural assertions: fail immediately if a future
+            # modification accidentally breaks MTD head-only mode.
+            # ----------------------------------------------------
+            if not base_model.training:
+                raise RuntimeError(
+                    'MTD mode bug: root STREAM model '
+                    'is not in training mode'
+                )
+
+            if not base_model.dense_head.training:
+                raise RuntimeError(
+                    'MTD mode bug: dense_head '
+                    'is not in training mode'
+                )
+
+            if hasattr(
+                base_model,
+                'mode'
+            ):
+                if base_model.mode != 'TRAIN':
+                    raise RuntimeError(
+                        'MTD mode bug: expected '
+                        f'base_model.mode=TRAIN, '
+                        f'got {base_model.mode}'
+                    )
+
+            if cur_it == 0:
+                logger.info(
+                    'MTD MODE AUDIT | '
+                    f'root.training={base_model.training} | '
+                    f'root.mode={base_model.mode} | '
+                    f'dense_head.training='
+                    f'{base_model.dense_head.training}'
+                )
 
         optimizer.zero_grad()
 
