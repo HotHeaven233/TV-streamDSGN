@@ -1,0 +1,393 @@
+CLASS_NAMES:
+- Car
+- Pedestrian
+- Cyclist
+DATA_CONFIG:
+  _BASE_CONFIG_: ./configs/stream/dataset_configs/kitti_tracking_streaming.yaml
+  later_flip: true
+  DATA_SPLIT:
+    train: train
+    test: val
+  INFO_PATH:
+    train:
+    - kitti_infos_train.pkl
+    test:
+    - kitti_infos_val.pkl
+  PREPARE_PATH: frame_stride_1-len_frames_40-token_prev3_prev2_prev_next
+  POINT_CLOUD_RANGE:
+  - 2
+  - -28.8
+  - -3
+  - 53.2
+  - 28.8
+  - 1
+  STEREO_VOXEL_SIZE:
+  - 0.2
+  - 0.2
+  - 0.4
+  ANNOS_FREQUENCY: 10
+  FRAME_STRIDE: 1
+  BOX3D_SUPERVISION: next8
+  DEPTH_SUPERVISION: token
+  TRAIN_DATA_AUGMENTOR:
+  - NAME: random_flip
+  - NAME: random_crop
+    MIN_REL_X: 0
+    MAX_REL_X: 0
+    MIN_REL_Y: 1.0
+    MAX_REL_Y: 1.0
+    MAX_CROP_H: 320
+    MAX_CROP_W: 1248
+  - NAME: filter_truncated
+    AREA_RATIO_THRESH: null
+    AREA_2D_RATIO_THRESH: null
+    GT_TRUNCATED_THRESH: 0.98
+  - NAME: random_world_rotation
+    WORLD_ROT_ANGLE:
+    - -0.1
+    - 0.1
+  - NAME: random_world_scaling
+    WORLD_SCALE_RANGE:
+    - 0.97
+    - 1.03
+  MTD_FUTURE_STEPS:
+  - 2
+  - 4
+  - 8
+  TRANSTREAMING_PAST_STEPS:
+  - 3
+  - 4
+  - 6
+  - 8
+MODEL:
+  NAME: transtreaming_stream_v2
+  SYNC_BN: true
+  USE_AMP:
+    TRAIN: true
+    TEST: true
+  WITH_GRAD_WHEN_OBTAINING_HISTORY: false
+  HISTORY_TAG:
+  - prev3
+  - prev2
+  - prev
+  HISTORY_FEATURES_NAME:
+  - spatial_features
+  FEATURE_EXTRACTOR:
+  - StreamDSGN2Backbone
+  - HeightCompression
+  FUSION_STAGE:
+  - TranstreamingBEVTAT
+  AFTER_FUSION:
+  - VANBackbone
+  - StreamDetHead
+  BACKBONE_3D:
+    NAME: StreamDSGN2Backbone
+    maxdisp: 256
+    downsample_disp: 4
+    GN: false
+    cat_img_feature: false
+    cat_right_img_feature: false
+    voxel_occupancy: false
+    front_surface_depth: true
+    num_3dconvs: 1
+    num_3dconvs_hg: 1
+    drop_psv: false
+    drop_psv_loss: true
+    squeeze_geo: false
+    geometry_volume_shift: 1
+    inv_smooth_psv: 0.1
+    inv_smooth_geo: 0.1
+    feature_backbone:
+      type: ResNet
+      depth: 18
+      num_stages: 4
+      out_indices:
+      - 0
+      - 1
+      - 2
+      - 3
+      frozen_stages: -1
+      norm_cfg:
+        type: BN
+        requires_grad: true
+      norm_eval: false
+      style: pytorch
+      with_max_pool: false
+      deep_stem: false
+      block_with_final_relu: false
+      base_channels: 64
+      strides:
+      - 1
+      - 2
+      - 1
+      - 1
+      dilations:
+      - 1
+      - 1
+      - 2
+      - 4
+      num_channels_factor:
+      - 1
+      - 2
+      - 2
+      - 2
+    feature_backbone_pretrained: null
+    feature_neck:
+      GN: false
+      drop_psv: false
+      in_dims:
+      - 3
+      - 64
+      - 128
+      - 128
+      - 128
+      start_level: 2
+      stereo_dim:
+      - 128
+      - 96
+      with_upconv: true
+      with_upconv_voxel: false
+      share_upconv: false
+      upconv_type: fpn
+      cat_img_feature: false
+      cat_right_img_feature: false
+      sem_dim:
+      - 128
+      - 96
+      with_sem_neck: false
+    cost_volume:
+    - type: concat
+      downsample: 4
+    cv_dim: 32
+    rpn3d_dim: 32
+    downsampled_depth_offset: 0.5
+    num_hg: 0
+  MAP_TO_BEV:
+    NAME: HeightCompression
+    NUM_BEV_FEATURES: 96
+    SPARSE_INPUT: false
+  FUSION_IN_SPATIAL_FEATURES:
+    NAME: TranstreamingBEVTAT
+    FEATURE_NAME: spatial_features
+    WINDOW_SIZE:
+    - 8
+    - 8
+    NUM_HEADS: 4
+    HIDDEN_CHANNELS: 96
+    DEPTH: 1
+    DROPOUT: 0.0
+    MAX_TIME: 32
+    PAST_LENGTH: 3
+  BACKBONE_2D:
+    NAME: VANBackbone
+    NUM_CHANNELS: 64
+    GN: false
+    K_SIZE: 7
+    DEPTHS:
+    - 2
+    - 2
+    EMBED_DIMS:
+    - 128
+    - 128
+    MLP_RATIOS:
+    - 2
+    - 2
+    DROP_RATE: 0.0
+    DROP_PATH_RATE: 0.0
+    UPSAMPLE_STRIDES:
+    - 2
+    - 2
+    NUM_UPSAMPLE_FILTERS:
+    - 128
+    - 64
+    MULTI_FUSION_TYPE: SUM
+    ATTN_TYPE: LKA
+  FUSION_IN_SPATIAL_FEATURES_2D: null
+  DENSE_HEAD:
+    NAME: StreamDetHead
+    BOX3D_SUPERVISION: next8
+    HISTORY_TAG: []
+    NUM_CONVS: 2
+    GN: false
+    CLASS_AGNOSTIC: false
+    USE_DIRECTION_CLASSIFIER: true
+    DIR_OFFSET: 0.78539
+    DIR_LIMIT_OFFSET: 0.0
+    NUM_DIR_BINS: 2
+    CLAMP_VALUE: 10.0
+    xyz_for_angles: true
+    hwl_for_angles: true
+    do_feature_imitation: false
+    imitation_cfg:
+    - lidar_feature_layer: spatial_features_2d
+      stereo_feature_layer: spatial_features_2d
+      normalize: cw_scale
+      layer: conv2d
+      channel: 64
+      ksize: 1
+      use_relu: false
+      mode: inbox
+    - lidar_feature_layer: volume_features
+      stereo_feature_layer: volume_features
+      normalize: cw_scale
+      layer: conv3d
+      channel: 32
+      ksize: 1
+      use_relu: false
+      mode: inbox
+    ANCHOR_GENERATOR_CONFIG:
+    - class_name: Car
+      anchor_sizes:
+      - - 3.9
+        - 1.6
+        - 1.56
+      anchor_rotations:
+      - 0
+      - 1.57
+      anchor_bottom_heights:
+      - -1.78
+      align_center: false
+      feature_map_stride: 1
+      matched_threshold: 0.6
+      unmatched_threshold: 0.45
+    - class_name: Pedestrian
+      anchor_sizes:
+      - - 0.8
+        - 0.6
+        - 1.73
+      anchor_rotations:
+      - 0
+      - 1.57
+      anchor_bottom_heights:
+      - -0.6
+      align_center: false
+      feature_map_stride: 1
+      matched_threshold: 0.5
+      unmatched_threshold: 0.35
+    - class_name: Cyclist
+      anchor_sizes:
+      - - 1.76
+        - 0.6
+        - 1.73
+      anchor_rotations:
+      - 0
+      - 1.57
+      anchor_bottom_heights:
+      - -0.6
+      align_center: false
+      feature_map_stride: 1
+      matched_threshold: 0.5
+      unmatched_threshold: 0.35
+    TARGET_ASSIGNER_CONFIG:
+      NAME: AxisAlignedTargetAssigner
+      POS_FRACTION: -1.0
+      SAMPLE_SIZE: 512
+      NORM_BY_NUM_EXAMPLES: false
+      MATCH_HEIGHT: false
+      BOX_CODER: ResidualCoder
+      BOX_CODER_CONFIG:
+        div_by_diagonal: true
+        use_corners: false
+        use_tanh: false
+    LOSS_CONFIG:
+      REG_LOSS_TYPE: WeightedSmoothL1Loss
+      IOU_LOSS_TYPE: IOU3dLoss
+      TREND_LOSS_TYPE: WeightedSmoothL1Loss
+      CALCULATE_TREND_CATEGORY:
+      - 1
+      - 2
+      - 3
+      IMITATION_LOSS_TYPE: WeightedL2WithSigmaLoss
+      LOSS_WEIGHTS:
+        cls_weight: 1.0
+        loc_weight: 0.5
+        dir_weight: 0.2
+        iou_weight: 1.0
+        trend_weight: 0.0
+        bal_hyparam: 0.2
+        imitation_weight: 1.0
+        code_weights:
+        - 1.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 1.0
+        - 1.0
+        trend_code_weight:
+        - 1.0
+        - 1.0
+        - 1.0
+        - 1.0
+  DEPTH_LOSS_HEAD:
+    NAME: StreamDepthLossHead
+    DEPTH_SUPERVISION: token
+    GET_DEPTH_ERROR_MAP_WHEN_INFERENCE: false
+    LOSS_TYPE:
+      ce: 1.0
+    WEIGHTS:
+    - 1.0
+  POST_PROCESSING:
+    RECALL_THRESH_LIST:
+    - 0.3
+    - 0.5
+    - 0.7
+    SCORE_THRESH: 0.1
+    OUTPUT_RAW_SCORE: false
+    EVAL_METRIC:
+    - offline_3d
+    NMS_CONFIG:
+      MULTI_CLASSES_NMS: true
+      NMS_TYPE: nms_gpu
+      NMS_THRESH: 0.25
+      NMS_PRE_MAXSIZE: 4096
+      NMS_POST_MAXSIZE: 500
+  TRANSTREAMING:
+    ENABLED: true
+    FREEZE_FEATURE_EXTRACTOR: true
+    TRAIN_FUTURE_STEPS:
+    - 1
+    - 2
+    - 4
+    - 8
+    TRAIN_PAST_PATTERNS:
+    - - -4
+      - -2
+      - -1
+    - - -8
+      - -4
+      - -2
+    - - -6
+      - -4
+      - -2
+    - - -3
+      - -2
+      - -1
+    PAST_PATTERN_WEIGHTS:
+    - 10
+    - 5
+    - 5
+    - 5
+    EVAL_FUTURE_STEPS:
+    - 1
+  USE_KD: null
+OPTIMIZATION:
+  BATCH_SIZE_PER_GPU: 1
+  NUM_EPOCHS: 15
+  OPTIMIZER: adam_onecycle
+  LR: 0.0002
+  WEIGHT_DECAY: 0.01
+  MOMENTUM: 0.9
+  MOMS:
+  - 0.95
+  - 0.85
+  PCT_START: 0.2
+  DIV_FACTOR: 10
+  DECAY_STEP_LIST:
+  - 8
+  - 10
+  LR_DECAY: 0.1
+  LR_CLIP: 1.0e-07
+  LR_WARMUP: true
+  WARMUP_EPOCH: 1
+  GRAD_NORM_CLIP: 10
